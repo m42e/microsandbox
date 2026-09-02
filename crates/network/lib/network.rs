@@ -190,13 +190,18 @@ impl SmoltcpNetwork {
     ) -> Result<Self, NetworkInitError> {
         enforce_deployment_profile(&mut config, deployment_profile);
         if config.config().upstream_proxy.is_none() {
-            let upstream_proxy = ["MSB_UPSTREAM_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
-                .iter()
-                .find_map(|key| {
-                    std::env::var(key)
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                });
+            let upstream_proxy = [
+                "MSB_UPSTREAM_PROXY",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "ALL_PROXY",
+            ]
+            .iter()
+            .find_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
             config.config_mut().upstream_proxy = upstream_proxy;
         }
         let platform_policy = Self::platform_policy(deployment_profile);

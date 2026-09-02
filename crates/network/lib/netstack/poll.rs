@@ -540,9 +540,8 @@ pub(crate) fn smoltcp_poll_loop(
                     .contains(&conn.dst.port())
             {
                 // TLS-intercepted port — spawn TLS MITM proxy.
-                let connect_target =
-                    resolve_tcp_host_target(conn.dst, config.gateway)
-                        .with_proxy(config.upstream_proxy.as_deref());
+                let connect_target = resolve_tcp_host_target(conn.dst, config.gateway)
+                    .with_proxy(config.upstream_proxy.as_deref());
                 let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                     &outbound_proxy,
                     conn.dst,
@@ -613,9 +612,8 @@ pub(crate) fn smoltcp_poll_loop(
                 continue;
             }
             // Plain TCP proxy.
-            let connect_target =
-                resolve_tcp_host_target(conn.dst, config.gateway)
-                    .with_proxy(config.upstream_proxy.as_deref());
+            let connect_target = resolve_tcp_host_target(conn.dst, config.gateway)
+                .with_proxy(config.upstream_proxy.as_deref());
             let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                 &outbound_proxy,
                 conn.dst,
@@ -1438,6 +1436,8 @@ mod tests {
             guest_ipv4: Some(Ipv4Addr::new(100, 96, 0, 2)),
             guest_ipv6: None,
             mtu: 1500,
+            proxy: HttpProxyConfig::default(),
+            upstream_proxy: None,
         };
         let guest_ipv4 = poll_config.guest_ipv4.unwrap();
         let gateway_ipv4 = poll_config.gateway.ipv4.unwrap();
@@ -1525,6 +1525,8 @@ mod tests {
             guest_ipv4: Some(Ipv4Addr::new(100, 96, 0, 2)),
             guest_ipv6: None,
             mtu: 1500,
+            proxy: HttpProxyConfig::default(),
+            upstream_proxy: None,
         };
         let policy = NetworkPolicy::builder().default_deny().build().unwrap();
         let frame = build_icmpv4_echo_frame(
@@ -1566,6 +1568,8 @@ mod tests {
             guest_ipv4: Some(guest),
             guest_ipv6: None,
             mtu: 1500,
+            proxy: HttpProxyConfig::default(),
+            upstream_proxy: None,
         };
         let frame = build_icmpv4_echo_frame(
             config.guest_mac,
@@ -1747,6 +1751,8 @@ mod tests {
             guest_ipv4: Some(Ipv4Addr::new(100, 96, 0, 2)),
             guest_ipv6: None,
             mtu: 1500,
+            proxy: HttpProxyConfig::default(),
+            upstream_proxy: None,
         };
         let guest_ipv4 = poll_config.guest_ipv4.unwrap();
         let gateway_ipv4 = poll_config.gateway.ipv4.unwrap();
@@ -1836,6 +1842,8 @@ mod tests {
             guest_ipv4: Some(Ipv4Addr::from(GUEST_IP)),
             guest_ipv6: None,
             mtu: 1500,
+            proxy: HttpProxyConfig::default(),
+            upstream_proxy: None,
         }
     }
 
