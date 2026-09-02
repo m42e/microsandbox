@@ -74,14 +74,18 @@ pub(crate) fn spawn(
         let platform_policy = platform_policy.clone();
         let shared = shared.clone();
         let handle = handle.clone();
-        handle.clone().spawn(async move {
-            let listener = match TcpListener::from_std(listener) {
+        let listener = {
+            let _guard = handle.enter();
+            match TcpListener::from_std(listener) {
                 Ok(listener) => listener,
                 Err(error) => {
                     tracing::warn!(%address, %error, "HTTP proxy listener failed to bind");
-                    return;
+                    continue;
                 }
-            };
+            }
+        };
+        let task_handle = handle.clone();
+        handle.spawn(async move {
             tracing::debug!(%address, "HTTP proxy listener started");
             loop {
                 let (stream, _) = match listener.accept().await {
@@ -95,7 +99,7 @@ pub(crate) fn spawn(
                 let network_policy = network_policy.clone();
                 let platform_policy = platform_policy.clone();
                 let shared = shared.clone();
-                handle.spawn(async move {
+                task_handle.spawn(async move {
                     if let Err(error) = serve(
                         stream,
                         upstream_proxy.as_deref(),
