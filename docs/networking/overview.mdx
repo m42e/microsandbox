@@ -81,6 +81,10 @@ When enabled, `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` (plus lowercase
 variants) are set in the guest unless explicitly supplied. The host alias and
 loopback addresses are added to `NO_PROXY`.
 
+Hostname allow-list entries are forwarded to the upstream proxy unchanged.
+Therefore, the upstream proxy's DNS resolution is part of the trust boundary:
+only use an upstream proxy whose DNS results you trust for the allowed hosts.
+
 ## Deployment profiles
 
 <Tooltip tip="Managed cloud deployments choose the platform isolation profile; per-sandbox and local-operator profile overrides are not accepted."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>

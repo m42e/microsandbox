@@ -38,6 +38,11 @@ struct Target {
     path: String,
 }
 
+enum ConnectionTarget {
+    Address(SocketAddr),
+    Hostname(String, u16),
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -171,55 +176,35 @@ async fn serve(
     let parsed = parse_request(&request)?;
     let target = parsed.target;
     let protocol = Protocol::Tcp;
-    let allowed = target_allowed(&target.host, target.port, network_policy, protocol, shared).await;
-    let platform_allowed = match platform_policy {
-        Some(policy) => target_allowed(&target.host, target.port, policy, protocol, shared).await,
-        None => true,
-    };
-    if !allowed || !platform_allowed {
+    let Some(connect_target) = target_connection_target(
+        &target.host,
+        target.port,
+        network_policy,
+        platform_policy,
+        protocol,
+        shared,
+    )
+    .await
+    else {
         guest
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             .await?;
         return Ok(());
-    }
+    };
 
-    async fn target_allowed(
-        host: &str,
-        port: u16,
-        policy: &NetworkPolicy,
-        protocol: Protocol,
-        shared: &SharedState,
-    ) -> bool {
-        if let Ok(address) = host.parse::<IpAddr>() {
-            return policy
-                .evaluate_egress(SocketAddr::new(address, port), protocol, shared)
-                .is_allow();
-        }
-
-        if !policy
-            .evaluate_proxy_hostname(host, protocol, port)
-            .is_allow()
-        {
-            return false;
-        }
-
-        let addresses = match tokio::net::lookup_host((host, port)).await {
-            Ok(addresses) => addresses.collect::<Vec<_>>(),
-            Err(error) => {
-                tracing::debug!(%error, host, port, "HTTP proxy target resolution failed");
-                return false;
-            }
-        };
-        !addresses.is_empty()
-            && addresses
-                .into_iter()
-                .all(|address| policy.evaluate_egress(address, protocol, shared).is_allow())
-    }
     let upstream_result = match upstream_proxy {
-        Some(proxy) => connect_upstream(proxy, &target.host, target.port).await,
-        None => TcpStream::connect((target.host.as_str(), target.port))
-            .await
-            .map(|stream| (stream, Vec::new())),
+        Some(proxy) => {
+            let (host, port) = match &connect_target {
+                ConnectionTarget::Address(address) => (address.ip().to_string(), address.port()),
+                ConnectionTarget::Hostname(host, port) => (host.clone(), *port),
+            };
+            connect_upstream(proxy, &host, port).await
+        }
+        None => match connect_target {
+            ConnectionTarget::Address(address) => TcpStream::connect(address).await,
+            ConnectionTarget::Hostname(host, port) => TcpStream::connect((host, port)).await,
+        }
+        .map(|stream| (stream, Vec::new())),
     };
     let (mut upstream, upstream_initial) = match upstream_result {
         Ok(result) => result,
@@ -253,6 +238,38 @@ async fn serve(
     upstream.flush().await?;
     tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
     Ok(())
+}
+
+async fn target_connection_target(
+    host: &str,
+    port: u16,
+    network_policy: &NetworkPolicy,
+    platform_policy: Option<&NetworkPolicy>,
+    protocol: Protocol,
+    shared: &SharedState,
+) -> Option<ConnectionTarget> {
+    let policies = [Some(network_policy), platform_policy];
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return policies
+            .into_iter()
+            .flatten()
+            .all(|policy| {
+                policy
+                    .evaluate_egress(SocketAddr::new(address, port), protocol, shared)
+                    .is_allow()
+            })
+            .then_some(ConnectionTarget::Address(SocketAddr::new(address, port)));
+    }
+
+    if policies.into_iter().flatten().any(|policy| {
+        !policy
+            .evaluate_proxy_hostname(host, protocol, port)
+            .is_allow()
+    }) {
+        return None;
+    }
+
+    Some(ConnectionTarget::Hostname(host.to_owned(), port))
 }
 
 async fn read_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
