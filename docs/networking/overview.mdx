@@ -72,7 +72,8 @@ that HTTP CONNECT proxy without resolving the destination hostname locally.
 network:
   proxy:
     enabled: true
-    port: 3128
+    # Omit port (or set it to 0) to assign a free port per sandbox.
+    port: 0
   upstream_proxy: http://proxy.example:8080
 ```
 

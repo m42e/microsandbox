@@ -42,41 +42,38 @@ struct Target {
 
 /// Start HTTP proxy listeners on the host loopback addresses used by a guest.
 pub(crate) fn spawn(
-    config: &HttpProxyConfig,
-    gateway_ipv4: Option<std::net::Ipv4Addr>,
-    gateway_ipv6: Option<std::net::Ipv6Addr>,
+    listeners: Option<HttpProxyListeners>,
     upstream_proxy: Option<String>,
     network_policy: Arc<NetworkPolicy>,
     platform_policy: Option<Arc<NetworkPolicy>>,
     shared: Arc<SharedState>,
     handle: &tokio::runtime::Handle,
 ) {
-    if !config.enabled {
+    let Some(listeners) = listeners else {
         return;
-    }
-    if config.port == 0 {
-        tracing::error!("HTTP proxy port must not be zero");
-        return;
-    }
+    };
 
-    for address in [
-        gateway_ipv4
-            .map(IpAddr::V4)
-            .map(|ip| SocketAddr::new(ip, config.port)),
-        gateway_ipv6
-            .map(IpAddr::V6)
-            .map(|ip| SocketAddr::new(ip, config.port)),
+    for (address, listener) in [
+        listeners
+            .ipv4
+            .map(|listener| (listener.local_addr().ok(), listener)),
+        listeners
+            .ipv6
+            .map(|listener| (listener.local_addr().ok(), listener)),
     ]
     .into_iter()
     .flatten()
     {
+        let Some(address) = address else {
+            continue;
+        };
         let upstream_proxy = upstream_proxy.clone();
         let network_policy = network_policy.clone();
         let platform_policy = platform_policy.clone();
         let shared = shared.clone();
         let handle = handle.clone();
         handle.clone().spawn(async move {
-            let listener = match TcpListener::bind(loopback_for_gateway(address)).await {
+            let listener = match TcpListener::from_std(listener) {
                 Ok(listener) => listener,
                 Err(error) => {
                     tracing::warn!(%address, %error, "HTTP proxy listener failed to bind");
@@ -114,14 +111,47 @@ pub(crate) fn spawn(
     }
 }
 
-fn loopback_for_gateway(address: SocketAddr) -> SocketAddr {
-    SocketAddr::new(
-        match address.ip() {
-            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        },
-        address.port(),
-    )
+pub(crate) struct HttpProxyListeners {
+    pub(crate) ipv4: Option<std::net::TcpListener>,
+    pub(crate) ipv6: Option<std::net::TcpListener>,
+}
+
+pub(crate) fn prepare(
+    config: &HttpProxyConfig,
+    gateway_ipv4: Option<std::net::Ipv4Addr>,
+    gateway_ipv6: Option<std::net::Ipv6Addr>,
+) -> io::Result<Option<(HttpProxyListeners, u16)>> {
+    if !config.enabled || (gateway_ipv4.is_none() && gateway_ipv6.is_none()) {
+        return Ok(None);
+    }
+
+    let bind_ipv4 = gateway_ipv4.is_some();
+    let bind_ipv6 = gateway_ipv6.is_some();
+    let first_address = if bind_ipv4 {
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), config.port)
+    } else {
+        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), config.port)
+    };
+    let first = std::net::TcpListener::bind(first_address)?;
+    first.set_nonblocking(true)?;
+    let port = first.local_addr()?.port();
+
+    let second = if bind_ipv4 && bind_ipv6 {
+        let address = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port);
+        let listener = std::net::TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        Some(listener)
+    } else {
+        None
+    };
+
+    let (ipv4, ipv6) = match (bind_ipv4, bind_ipv6) {
+        (true, true) => (Some(first), second),
+        (true, false) => (Some(first), None),
+        (false, true) => (None, Some(first)),
+        (false, false) => unreachable!("proxy listener requires an active gateway family"),
+    };
+    Ok(Some((HttpProxyListeners { ipv4, ipv6 }, port)))
 }
 
 async fn serve(

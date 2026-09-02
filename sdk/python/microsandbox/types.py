@@ -1684,7 +1684,7 @@ class HttpProxy:
     """Guest-facing HTTP forward proxy."""
 
     enabled: bool = True
-    port: int = 3128
+    port: int = 0
 
     def _to_dict(self) -> dict:
         return {"enabled": self.enabled, "port": self.port}

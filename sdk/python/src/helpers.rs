@@ -1376,7 +1376,7 @@ fn apply_network(
     {
         let proxy: Bound<'_, PyDict> = proxy.downcast::<PyDict>()?.clone();
         let enabled = extract_opt::<bool>(&proxy, "enabled")?.unwrap_or(true);
-        let port = extract_opt::<u16>(&proxy, "port")?.unwrap_or(3128);
+        let port = extract_opt::<u16>(&proxy, "port")?.unwrap_or(0);
         builder = builder.network(move |n| n.proxy(enabled, port));
     }
     if let Some(upstream) = extract_opt::<String>(net, "upstream_proxy")? {

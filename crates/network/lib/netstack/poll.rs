@@ -21,7 +21,7 @@ use smoltcp::wire::{
     Ipv6Repr, TcpPacket, UdpPacket,
 };
 
-use crate::config::{DnsConfig, PublishedPort};
+use crate::config::{DnsConfig, HttpProxyConfig, PublishedPort};
 use crate::dns::common::ports::DnsPortType;
 use crate::dns::{
     interceptor::DnsInterceptor,
@@ -32,6 +32,7 @@ use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::handle::SecretsHandle;
+use crate::tcp::http;
 use crate::tcp::{connection::ConnectionTracker, proxy::TcpProxy, upstream::UpstreamTcpTarget};
 use crate::tls::{proxy::TlsProxy, state::TlsState};
 use crate::udp::fragments::{
@@ -112,6 +113,10 @@ pub struct PollLoopConfig {
     pub guest_ipv6: Option<Ipv6Addr>,
     /// IP-level MTU (e.g. 1500).
     pub mtu: usize,
+    /// Guest-facing HTTP proxy configuration.
+    pub proxy: HttpProxyConfig,
+    /// Optional host-side HTTP CONNECT proxy.
+    pub upstream_proxy: Option<String>,
 }
 
 /// Per-sandbox gateway addresses owned by the smoltcp virtual stack.
@@ -236,6 +241,7 @@ pub fn smoltcp_poll_loop(
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    proxy_listeners: Option<http::HttpProxyListeners>,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -283,6 +289,14 @@ pub fn smoltcp_poll_loop(
         config.gateway_mac,
         config.guest_mac,
         network_policy.clone(),
+        shared.clone(),
+        &tokio_handle,
+    );
+    http::spawn(
+        proxy_listeners,
+        config.upstream_proxy.clone(),
+        network_policy.clone(),
+        platform_policy.clone(),
         shared.clone(),
         &tokio_handle,
     );
