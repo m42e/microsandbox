@@ -2,11 +2,14 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::HttpProxyConfig;
+use crate::netstack::shared::SharedState;
+use crate::policy::{NetworkPolicy, Protocol};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -43,6 +46,9 @@ pub(crate) fn spawn(
     gateway_ipv4: Option<std::net::Ipv4Addr>,
     gateway_ipv6: Option<std::net::Ipv6Addr>,
     upstream_proxy: Option<String>,
+    network_policy: Arc<NetworkPolicy>,
+    platform_policy: Option<Arc<NetworkPolicy>>,
+    shared: Arc<SharedState>,
     handle: &tokio::runtime::Handle,
 ) {
     if !config.enabled {
@@ -65,6 +71,9 @@ pub(crate) fn spawn(
     .flatten()
     {
         let upstream_proxy = upstream_proxy.clone();
+        let network_policy = network_policy.clone();
+        let platform_policy = platform_policy.clone();
+        let shared = shared.clone();
         let handle = handle.clone();
         handle.clone().spawn(async move {
             let listener = match TcpListener::bind(loopback_for_gateway(address)).await {
@@ -84,8 +93,19 @@ pub(crate) fn spawn(
                     }
                 };
                 let upstream_proxy = upstream_proxy.clone();
+                let network_policy = network_policy.clone();
+                let platform_policy = platform_policy.clone();
+                let shared = shared.clone();
                 handle.spawn(async move {
-                    if let Err(error) = serve(stream, upstream_proxy.as_deref()).await {
+                    if let Err(error) = serve(
+                        stream,
+                        upstream_proxy.as_deref(),
+                        &network_policy,
+                        platform_policy.as_deref(),
+                        &shared,
+                    )
+                    .await
+                    {
                         tracing::debug!(%error, "HTTP proxy connection closed");
                     }
                 });
@@ -104,10 +124,40 @@ fn loopback_for_gateway(address: SocketAddr) -> SocketAddr {
     )
 }
 
-async fn serve(mut guest: TcpStream, upstream_proxy: Option<&str>) -> io::Result<()> {
+async fn serve(
+    mut guest: TcpStream,
+    upstream_proxy: Option<&str>,
+    network_policy: &NetworkPolicy,
+    platform_policy: Option<&NetworkPolicy>,
+    shared: &SharedState,
+) -> io::Result<()> {
     let request = read_headers(&mut guest).await?;
     let parsed = parse_request(&request)?;
     let target = parsed.target;
+    let protocol = Protocol::Tcp;
+    let allowed = match target.host.parse::<IpAddr>() {
+        Ok(address) => network_policy
+            .evaluate_egress(SocketAddr::new(address, target.port), protocol, shared)
+            .is_allow(),
+        Err(_) => network_policy
+            .evaluate_proxy_hostname(&target.host, protocol, target.port)
+            .is_allow(),
+    };
+    let platform_allowed =
+        platform_policy.is_none_or(|policy| match target.host.parse::<IpAddr>() {
+            Ok(address) => policy
+                .evaluate_egress(SocketAddr::new(address, target.port), protocol, shared)
+                .is_allow(),
+            Err(_) => policy
+                .evaluate_proxy_hostname(&target.host, protocol, target.port)
+                .is_allow(),
+        });
+    if !allowed || !platform_allowed {
+        guest
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
     let (mut upstream, upstream_initial) = match upstream_proxy {
         Some(proxy) => connect_upstream(proxy, &target.host, target.port).await?,
         None => (
