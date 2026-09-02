@@ -189,6 +189,16 @@ impl SmoltcpNetwork {
         host_routes: HostRoutes,
     ) -> Result<Self, NetworkInitError> {
         enforce_deployment_profile(&mut config, deployment_profile);
+        if config.config().upstream_proxy.is_none() {
+            let upstream_proxy = ["MSB_UPSTREAM_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
+                .iter()
+                .find_map(|key| {
+                    std::env::var(key)
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                });
+            config.config_mut().upstream_proxy = upstream_proxy;
+        }
         let platform_policy = Self::platform_policy(deployment_profile);
         let mut resolved_config = config;
         let config = resolved_config.config().clone();
@@ -333,8 +343,8 @@ impl SmoltcpNetwork {
             guest_ipv4: self.guest_ipv4,
             guest_ipv6: self.guest_ipv6,
             mtu: self.mtu as usize,
-            proxy: config.proxy.clone(),
-            upstream_proxy: config.upstream_proxy.clone(),
+            proxy: self.config.config().proxy.clone(),
+            upstream_proxy: self.config.config().upstream_proxy.clone(),
         };
         let config = self.config.config();
         let network_policy = config.policy.clone();
@@ -417,6 +427,29 @@ impl SmoltcpNetwork {
         }
 
         vars
+    }
+
+    /// Generate proxy environment variables for the guest when its HTTP proxy is enabled.
+    pub fn guest_proxy_env(&self) -> Vec<(String, String)> {
+        let proxy = &self.config.config().proxy;
+        if !proxy.enabled {
+            return Vec::new();
+        }
+        let value = format!("http://{}:{}", crate::HOST_ALIAS, proxy.port);
+        let no_proxy = format!("{},127.0.0.1,::1", crate::HOST_ALIAS);
+        [
+            ("HTTP_PROXY", value.clone()),
+            ("HTTPS_PROXY", value.clone()),
+            ("ALL_PROXY", value.clone()),
+            ("http_proxy", value.clone()),
+            ("https_proxy", value.clone()),
+            ("all_proxy", value),
+            ("NO_PROXY", no_proxy.clone()),
+            ("no_proxy", no_proxy),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
     }
 
     /// Build the typed network payload consumed by agentd during bootstrap.

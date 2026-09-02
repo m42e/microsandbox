@@ -229,7 +229,7 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
 /// * `tokio_handle` - Runtime handle used for proxy tasks, DNS forwarding, port publishing,
 ///   and ICMP relays.
 #[allow(clippy::too_many_arguments)]
-pub fn smoltcp_poll_loop(
+pub(crate) fn smoltcp_poll_loop(
     shared: Arc<SharedState>,
     config: PollLoopConfig,
     network_policy: NetworkPolicy,
@@ -540,7 +540,9 @@ pub fn smoltcp_poll_loop(
                     .contains(&conn.dst.port())
             {
                 // TLS-intercepted port — spawn TLS MITM proxy.
-                let connect_target = resolve_tcp_host_target(conn.dst, config.gateway);
+                let connect_target =
+                    resolve_tcp_host_target(conn.dst, config.gateway)
+                        .with_proxy(config.upstream_proxy.as_deref());
                 let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                     &outbound_proxy,
                     conn.dst,
@@ -611,7 +613,9 @@ pub fn smoltcp_poll_loop(
                 continue;
             }
             // Plain TCP proxy.
-            let connect_target = resolve_tcp_host_target(conn.dst, config.gateway);
+            let connect_target =
+                resolve_tcp_host_target(conn.dst, config.gateway)
+                    .with_proxy(config.upstream_proxy.as_deref());
             let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                 &outbound_proxy,
                 conn.dst,
