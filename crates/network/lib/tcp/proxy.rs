@@ -264,6 +264,7 @@ impl TcpProxy {
         // seen the server's banner; with the socket already open we can relay that
         // banner while we wait, instead of burning the peek budget pre-connect.
         let stream = connect_target
+            .clone()
             .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
             .await?;
         let connect_dst = stream.peer_addr().unwrap_or(connect_target.primary());
@@ -550,6 +551,7 @@ async fn handle_connect_tunnel(
         Some(stream) => stream,
         None => {
             proxy_target
+                .clone()
                 .connect(&proxy_connect, &shared, outbound_proxy.as_deref())
                 .await?
         }

@@ -1,0 +1,431 @@
+//! Guest-facing HTTP forward proxy.
+
+use std::io;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+use crate::config::HttpProxyConfig;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const MAX_HEADERS: usize = 64 * 1024;
+const CONNECT_RESPONSE_LIMIT: usize = 8192;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct ParsedRequest {
+    connect: bool,
+    target: Target,
+    request_line: Vec<u8>,
+    header_tail: Vec<u8>,
+    body: Vec<u8>,
+}
+
+struct Target {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Start HTTP proxy listeners on the host loopback addresses used by a guest.
+pub(crate) fn spawn(
+    config: &HttpProxyConfig,
+    gateway_ipv4: Option<std::net::Ipv4Addr>,
+    gateway_ipv6: Option<std::net::Ipv6Addr>,
+    upstream_proxy: Option<String>,
+    handle: &tokio::runtime::Handle,
+) {
+    if !config.enabled {
+        return;
+    }
+    if config.port == 0 {
+        tracing::error!("HTTP proxy port must not be zero");
+        return;
+    }
+
+    for address in [
+        gateway_ipv4
+            .map(IpAddr::V4)
+            .map(|ip| SocketAddr::new(ip, config.port)),
+        gateway_ipv6
+            .map(IpAddr::V6)
+            .map(|ip| SocketAddr::new(ip, config.port)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let upstream_proxy = upstream_proxy.clone();
+        let handle = handle.clone();
+        handle.clone().spawn(async move {
+            let listener = match TcpListener::bind(loopback_for_gateway(address)).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::warn!(%address, %error, "HTTP proxy listener failed to bind");
+                    return;
+                }
+            };
+            tracing::debug!(%address, "HTTP proxy listener started");
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::debug!(%address, %error, "HTTP proxy accept failed");
+                        continue;
+                    }
+                };
+                let upstream_proxy = upstream_proxy.clone();
+                handle.spawn(async move {
+                    if let Err(error) = serve(stream, upstream_proxy.as_deref()).await {
+                        tracing::debug!(%error, "HTTP proxy connection closed");
+                    }
+                });
+            }
+        });
+    }
+}
+
+fn loopback_for_gateway(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(
+        match address.ip() {
+            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        },
+        address.port(),
+    )
+}
+
+async fn serve(mut guest: TcpStream, upstream_proxy: Option<&str>) -> io::Result<()> {
+    let request = read_headers(&mut guest).await?;
+    let parsed = parse_request(&request)?;
+    let target = parsed.target;
+    let (mut upstream, upstream_initial) = match upstream_proxy {
+        Some(proxy) => connect_upstream(proxy, &target.host, target.port).await?,
+        None => (
+            TcpStream::connect((target.host.as_str(), target.port)).await?,
+            Vec::new(),
+        ),
+    };
+
+    if parsed.connect {
+        let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+        guest.write_all(response).await?;
+        if !upstream_initial.is_empty() {
+            guest.write_all(&upstream_initial).await?;
+        }
+        if !parsed.body.is_empty() {
+            upstream.write_all(&parsed.body).await?;
+        }
+    } else {
+        let mut first_line = parsed.request_line;
+        first_line = rewrite_request_line(&first_line, &target.path)?;
+        upstream.write_all(&first_line).await?;
+        upstream.write_all(&parsed.header_tail).await?;
+        if !parsed.body.is_empty() {
+            upstream.write_all(&parsed.body).await?;
+        }
+    }
+    upstream.flush().await?;
+    tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
+    Ok(())
+}
+
+async fn read_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "timed out reading proxy request")
+            })??;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "proxy request ended before headers",
+            ));
+        }
+        data.extend_from_slice(&buf[..n]);
+        if data.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(data);
+        }
+        if data.len() > MAX_HEADERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proxy request headers too large",
+            ));
+        }
+    }
+}
+
+fn parse_request(data: &[u8]) -> io::Result<ParsedRequest> {
+    let end = data
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "incomplete proxy headers"))?;
+    let header = &data[..end];
+    let line_end = header
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP request line"))?;
+    let line = &header[..line_end];
+    let text = std::str::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP request is not UTF-8"))?;
+    let mut parts = text.split_ascii_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let uri = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if uri.is_empty() || !version.starts_with("HTTP/") || parts.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed HTTP request line",
+        ));
+    }
+
+    let connect = method.eq_ignore_ascii_case("CONNECT");
+    let target = if connect {
+        let (host, port) = parse_authority(uri)?;
+        Target {
+            host,
+            port,
+            path: String::new(),
+        }
+    } else {
+        let url = url::Url::parse(uri).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP proxy requires an absolute-form request target",
+            )
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported HTTP proxy request scheme",
+            ));
+        }
+        let host = url
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "request target has no host")
+            })?
+            .to_string();
+        let port = url.port_or_known_default().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "request target has no port")
+        })?;
+        let mut path = if url.path().is_empty() {
+            "/".to_string()
+        } else {
+            url.path().to_string()
+        };
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        Target { host, port, path }
+    };
+
+    let body = if connect {
+        data[end..].to_vec()
+    } else {
+        data[line_end + 2..].to_vec()
+    };
+    Ok(ParsedRequest {
+        connect,
+        target,
+        request_line: data[..line_end + 2].to_vec(),
+        header_tail: data[line_end + 2..end].to_vec(),
+        body,
+    })
+}
+
+fn parse_authority(value: &str) -> io::Result<(String, u16)> {
+    let value = value.trim();
+    let (host, port) = if let Some(value) = value.strip_prefix('[') {
+        let (host, rest) = value.split_once(']').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed IPv6 proxy authority")
+        })?;
+        (
+            host,
+            rest.strip_prefix(':').ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "proxy authority has no port")
+            })?,
+        )
+    } else {
+        value.rsplit_once(':').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "proxy authority has no port")
+        })?
+    };
+    if host.is_empty() || host.contains(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid proxy authority host",
+        ));
+    }
+    let port = port
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid proxy authority port"))?;
+    Ok((host.trim_end_matches('.').to_string(), port))
+}
+
+fn rewrite_request_line(line: &[u8], path: &str) -> io::Result<Vec<u8>> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP request is not UTF-8"))?;
+    let mut parts = text.split_ascii_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let _ = parts.next();
+    let version = parts.next().unwrap_or_default();
+    if method.is_empty() || version.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed HTTP request line",
+        ));
+    }
+    Ok(format!("{method} {path} {version}\r\n").into_bytes())
+}
+
+async fn connect_upstream(proxy: &str, host: &str, port: u16) -> io::Result<(TcpStream, Vec<u8>)> {
+    let url = url::Url::parse(proxy).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid upstream proxy URL: {error}"),
+        )
+    })?;
+    if url.scheme() != "http" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "upstream proxy must use http",
+        ));
+    }
+    let proxy_host = url
+        .host_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upstream proxy has no host"))?;
+    let proxy_port = url
+        .port_or_known_default()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upstream proxy has no port"))?;
+    let address = (proxy_host, proxy_port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "upstream proxy unresolved")
+        })?;
+    let mut stream = TcpStream::connect(address).await?;
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_response_headers(&mut stream).await?;
+    let status = response
+        .split(|byte| byte.is_ascii_whitespace())
+        .nth(1)
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u16>().ok());
+    if !response.starts_with(b"HTTP/") || !status.is_some_and(|status| (200..300).contains(&status))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "upstream proxy rejected CONNECT",
+        ));
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response headers were checked by read_response_headers")
+        + 4;
+    Ok((stream, response[header_end..].to_vec()))
+}
+
+async fn read_response_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(256);
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream proxy closed before CONNECT response",
+            ));
+        }
+        data.extend_from_slice(&buf[..n]);
+        if data.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(data);
+        }
+        if data.len() > CONNECT_RESPONSE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream proxy response headers too large",
+            ));
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn parses_absolute_form() {
+        let request =
+            parse_request(b"GET http://example.com/a?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap();
+        assert_eq!(request.target.host, "example.com");
+        assert_eq!(request.target.port, 80);
+        assert_eq!(request.target.path, "/a?q=1");
+        assert_eq!(request.header_tail, b"Host: example.com\r\n\r\n".to_vec());
+        assert!(!request.connect);
+    }
+
+    #[test]
+    fn parses_connect_authority() {
+        let request = parse_request(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(request.target.host, "example.com");
+        assert_eq!(request.target.port, 443);
+        assert!(request.connect);
+    }
+
+    #[test]
+    fn rewrites_absolute_form_to_origin_form() {
+        assert_eq!(
+            rewrite_request_line(b"GET http://example.com/a HTTP/1.1\r\n", "/a").unwrap(),
+            b"GET /a HTTP/1.1\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_connect_preserves_destination_hostname() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await.unwrap();
+            assert!(request.starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let proxy = format!("http://{address}");
+        let (_stream, initial) = connect_upstream(&proxy, "example.com", 443).await.unwrap();
+        assert!(initial.is_empty());
+        task.await.unwrap();
+    }
+}

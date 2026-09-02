@@ -30,7 +30,7 @@ pub use domain::{
     Action, CertCacheConfig, CpuPlacement, DEFAULT_METRICS_SAMPLE_INTERVAL_MS,
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
     DestinationGroup, Direction, DiskImageFormat, DnsConfig, DnsConfigPatch, EnvVar, FlatClone,
-    HandoffInit, HostPattern, HostPermissions, InterceptCaConfig, InterfaceOverrides,
+    HandoffInit, HostPattern, HostPermissions, HttpProxyConfig, HttpProxyConfigPatch, InterceptCaConfig, InterfaceOverrides,
     InterfaceOverridesPatch, LogSource, MAX_SECRET_PLACEHOLDER_BYTES, MemoryPlacement,
     MountOptions, NamedVolumeCreate, NamedVolumeMode, NetworkPolicy, NetworkRateLimitDirection,
     NetworkRateLimiterConfig, NetworkRateLimiterConfigPatch, NetworkSpec, NetworkSpecPatch,
