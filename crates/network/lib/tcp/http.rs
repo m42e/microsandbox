@@ -171,28 +171,49 @@ async fn serve(
     let parsed = parse_request(&request)?;
     let target = parsed.target;
     let protocol = Protocol::Tcp;
-    let allowed = match target.host.parse::<IpAddr>() {
-        Ok(address) => network_policy
-            .evaluate_egress(SocketAddr::new(address, target.port), protocol, shared)
-            .is_allow(),
-        Err(_) => network_policy
-            .evaluate_proxy_hostname(&target.host, protocol, target.port)
-            .is_allow(),
+    let allowed = target_allowed(&target.host, target.port, network_policy, protocol, shared).await;
+    let platform_allowed = match platform_policy {
+        Some(policy) => target_allowed(&target.host, target.port, policy, protocol, shared).await,
+        None => true,
     };
-    let platform_allowed =
-        platform_policy.is_none_or(|policy| match target.host.parse::<IpAddr>() {
-            Ok(address) => policy
-                .evaluate_egress(SocketAddr::new(address, target.port), protocol, shared)
-                .is_allow(),
-            Err(_) => policy
-                .evaluate_proxy_hostname(&target.host, protocol, target.port)
-                .is_allow(),
-        });
     if !allowed || !platform_allowed {
         guest
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             .await?;
         return Ok(());
+    }
+
+    async fn target_allowed(
+        host: &str,
+        port: u16,
+        policy: &NetworkPolicy,
+        protocol: Protocol,
+        shared: &SharedState,
+    ) -> bool {
+        if let Ok(address) = host.parse::<IpAddr>() {
+            return policy
+                .evaluate_egress(SocketAddr::new(address, port), protocol, shared)
+                .is_allow();
+        }
+
+        if !policy
+            .evaluate_proxy_hostname(host, protocol, port)
+            .is_allow()
+        {
+            return false;
+        }
+
+        let addresses = match tokio::net::lookup_host((host, port)).await {
+            Ok(addresses) => addresses.collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::debug!(%error, host, port, "HTTP proxy target resolution failed");
+                return false;
+            }
+        };
+        !addresses.is_empty()
+            && addresses
+                .into_iter()
+                .all(|address| policy.evaluate_egress(address, protocol, shared).is_allow())
     }
     let upstream_result = match upstream_proxy {
         Some(proxy) => connect_upstream(proxy, &target.host, target.port).await,

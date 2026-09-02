@@ -573,8 +573,14 @@ impl NetworkPolicy {
             }
             let matched = match &rule.destination {
                 Destination::Any => rule_matches_protocol_and_port(rule, protocol, port),
-                Destination::Domain(domain) => hostname == domain.as_str(),
-                Destination::DomainSuffix(suffix) => matches_suffix(&hostname, suffix.as_str()),
+                Destination::Domain(domain) => {
+                    hostname == domain.as_str()
+                        && rule_matches_protocol_and_port(rule, protocol, port)
+                }
+                Destination::DomainSuffix(suffix) => {
+                    matches_suffix(&hostname, suffix.as_str())
+                        && rule_matches_protocol_and_port(rule, protocol, port)
+                }
                 Destination::Cidr(_) | Destination::Group(_) => false,
             };
             if matched {
