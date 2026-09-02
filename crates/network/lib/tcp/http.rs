@@ -3,6 +3,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,6 +18,7 @@ use crate::policy::{NetworkPolicy, Protocol};
 
 const MAX_HEADERS: usize = 64 * 1024;
 const CONNECT_RESPONSE_LIMIT: usize = 8192;
+const CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -432,7 +434,14 @@ async fn read_response_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut data = Vec::with_capacity(256);
     let mut buf = [0u8; 4096];
     loop {
-        let n = stream.read(&mut buf).await?;
+        let n = tokio::time::timeout(CONNECT_RESPONSE_TIMEOUT, stream.read(&mut buf))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for upstream CONNECT response",
+                )
+            })??;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

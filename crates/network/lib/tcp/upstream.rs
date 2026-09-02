@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -9,6 +10,12 @@ use tokio::net::TcpStream;
 use super::connection::ProxyConnectState;
 use crate::netstack::shared::SharedState;
 use crate::proxy::ResolvedOutboundProxy;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -124,7 +131,14 @@ impl UpstreamTcpTarget {
         let mut response = Vec::with_capacity(128);
         let mut byte = [0u8; 1];
         while response.len() < 8192 && !response.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).await?;
+            tokio::time::timeout(CONNECT_RESPONSE_TIMEOUT, stream.read_exact(&mut byte))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for upstream CONNECT response",
+                    )
+                })??;
             response.push(byte[0]);
         }
         let status = response
