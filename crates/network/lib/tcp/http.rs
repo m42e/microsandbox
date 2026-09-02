@@ -1,7 +1,7 @@
 //! Guest-facing HTTP forward proxy.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,12 +194,21 @@ async fn serve(
             .await?;
         return Ok(());
     }
-    let (mut upstream, upstream_initial) = match upstream_proxy {
-        Some(proxy) => connect_upstream(proxy, &target.host, target.port).await?,
-        None => (
-            TcpStream::connect((target.host.as_str(), target.port)).await?,
-            Vec::new(),
-        ),
+    let upstream_result = match upstream_proxy {
+        Some(proxy) => connect_upstream(proxy, &target.host, target.port).await,
+        None => TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map(|stream| (stream, Vec::new())),
+    };
+    let (mut upstream, upstream_initial) = match upstream_result {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::debug!(%error, target = %target.host, port = target.port, "HTTP proxy upstream connection failed");
+            guest
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
     };
 
     if parsed.connect {
@@ -399,13 +408,7 @@ async fn connect_upstream(proxy: &str, host: &str, port: u16) -> io::Result<(Tcp
     let proxy_port = url
         .port_or_known_default()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upstream proxy has no port"))?;
-    let address = (proxy_host, proxy_port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::AddrNotAvailable, "upstream proxy unresolved")
-        })?;
-    let mut stream = TcpStream::connect(address).await?;
+    let mut stream = TcpStream::connect((proxy_host, proxy_port)).await?;
     let authority = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {

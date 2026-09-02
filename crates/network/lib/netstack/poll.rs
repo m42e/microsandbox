@@ -405,21 +405,39 @@ pub(crate) fn smoltcp_poll_loop(
                         // Other: regular outbound — defer Domain rules to first-flight;
                         // accept unless an IP-layer rule denies.
                         DnsPortType::Other => {
-                            let platform_allows = platform_policy.as_deref().is_none_or(|policy| {
-                                policy
-                                    .evaluate_egress(dst, Protocol::Tcp, &shared)
-                                    .is_allow()
-                            });
-                            platform_allows
-                                && matches!(
-                                    network_policy.evaluate_egress_with_source(
-                                        dst,
-                                        Protocol::Tcp,
-                                        &shared,
-                                        HostnameSource::Deferred,
-                                    ),
-                                    EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname
-                                )
+                            let guest_http_proxy = config.proxy.enabled
+                                && dst.port() == config.proxy.port
+                                && config
+                                    .gateway
+                                    .ipv4
+                                    .is_some_and(|gateway| dst.ip() == IpAddr::V4(gateway))
+                                || config.proxy.enabled
+                                    && dst.port() == config.proxy.port
+                                    && config
+                                        .gateway
+                                        .ipv6
+                                        .is_some_and(|gateway| dst.ip() == IpAddr::V6(gateway));
+                            if guest_http_proxy {
+                                true
+                            } else {
+                                let platform_allows =
+                                    platform_policy.as_deref().is_none_or(|policy| {
+                                        policy
+                                            .evaluate_egress(dst, Protocol::Tcp, &shared)
+                                            .is_allow()
+                                    });
+                                platform_allows
+                                    && matches!(
+                                        network_policy.evaluate_egress_with_source(
+                                            dst,
+                                            Protocol::Tcp,
+                                            &shared,
+                                            HostnameSource::Deferred,
+                                        ),
+                                        EgressEvaluation::Allow
+                                            | EgressEvaluation::DeferUntilHostname
+                                    )
+                            }
                         }
                     };
                     if allow && !conn_tracker.has_socket_for(&src, &dst) {
@@ -540,8 +558,11 @@ pub(crate) fn smoltcp_poll_loop(
                     .contains(&conn.dst.port())
             {
                 // TLS-intercepted port — spawn TLS MITM proxy.
-                let connect_target = resolve_tcp_host_target(conn.dst, config.gateway)
-                    .with_proxy(config.upstream_proxy.as_deref());
+                let connect_target = resolve_tcp_host_target(
+                    conn.dst,
+                    config.gateway,
+                    config.upstream_proxy.as_deref(),
+                );
                 let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                     &outbound_proxy,
                     conn.dst,
@@ -612,8 +633,8 @@ pub(crate) fn smoltcp_poll_loop(
                 continue;
             }
             // Plain TCP proxy.
-            let connect_target = resolve_tcp_host_target(conn.dst, config.gateway)
-                .with_proxy(config.upstream_proxy.as_deref());
+            let connect_target =
+                resolve_tcp_host_target(conn.dst, config.gateway, config.upstream_proxy.as_deref());
             let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                 &outbound_proxy,
                 conn.dst,
@@ -832,7 +853,11 @@ fn handle_reassembled_udp_datagram(
 /// A guest connection to either gateway family first dials the matching host
 /// loopback address, then may fall back to the other loopback family. Regular
 /// outbound destinations have no fallback.
-fn resolve_tcp_host_target(dst: SocketAddr, gateway: GatewayIps) -> UpstreamTcpTarget {
+fn resolve_tcp_host_target(
+    dst: SocketAddr,
+    gateway: GatewayIps,
+    upstream_proxy: Option<&str>,
+) -> UpstreamTcpTarget {
     let port = dst.port();
     match dst.ip() {
         IpAddr::V4(v4) if gateway.ipv4 == Some(v4) => UpstreamTcpTarget::with_fallback(
@@ -843,7 +868,7 @@ fn resolve_tcp_host_target(dst: SocketAddr, gateway: GatewayIps) -> UpstreamTcpT
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
         ),
-        _ => UpstreamTcpTarget::direct(dst),
+        _ => UpstreamTcpTarget::direct(dst).with_proxy(upstream_proxy),
     }
 }
 
@@ -1605,7 +1630,7 @@ mod tests {
         let dst = SocketAddr::new(IpAddr::V4(gw.ipv4.unwrap()), 8080);
 
         assert_eq!(
-            resolve_tcp_host_target(dst, gw),
+            resolve_tcp_host_target(dst, gw, None),
             UpstreamTcpTarget::with_fallback(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
@@ -1619,7 +1644,7 @@ mod tests {
         let dst = SocketAddr::new(IpAddr::V6(gw.ipv6.unwrap()), 8080);
 
         assert_eq!(
-            resolve_tcp_host_target(dst, gw),
+            resolve_tcp_host_target(dst, gw, None),
             UpstreamTcpTarget::with_fallback(
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
@@ -1632,7 +1657,7 @@ mod tests {
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443);
 
         assert_eq!(
-            resolve_tcp_host_target(dst, test_gateway()),
+            resolve_tcp_host_target(dst, test_gateway(), None),
             UpstreamTcpTarget::direct(dst)
         );
     }
@@ -1679,7 +1704,7 @@ mod tests {
     fn outbound_proxy_is_skipped_for_host_destination() {
         let gw = test_gateway();
         let guest_dst = SocketAddr::new(IpAddr::V4(gw.ipv4.unwrap()), 8080);
-        let connect_target = resolve_tcp_host_target(guest_dst, gw);
+        let connect_target = resolve_tcp_host_target(guest_dst, gw, None);
         let proxy = Some(Arc::new(ResolvedOutboundProxy::Socks5 {
             address: "192.0.2.1:1080".parse().unwrap(),
             credentials: None,
@@ -1699,7 +1724,7 @@ mod tests {
     fn outbound_proxy_is_preserved_for_external_destination() {
         let gw = test_gateway();
         let guest_dst = "198.51.100.10:443".parse().unwrap();
-        let connect_target = resolve_tcp_host_target(guest_dst, gw);
+        let connect_target = resolve_tcp_host_target(guest_dst, gw, None);
         let proxy = Some(Arc::new(ResolvedOutboundProxy::Socks5 {
             address: "192.0.2.1:1080".parse().unwrap(),
             credentials: None,

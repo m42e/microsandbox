@@ -193,7 +193,8 @@ impl TcpProxy {
         // *not* gate the connect, so they no longer force a peek here — that work is
         // deferred to `classify_first_flight` after the socket is open, where it can
         // run without stalling server-first protocols (see below).
-        let (mut initial_buf, sni) = if network_policy.has_domain_rules() {
+        let host_destination = connect_target.primary().ip().is_loopback();
+        let (mut initial_buf, sni) = if network_policy.has_domain_rules() && !host_destination {
             peek_for_sni(&mut from_smoltcp, PEEK_BUF_SIZE, PEEK_BUDGET).await
         } else {
             (Vec::new(), None)
@@ -204,7 +205,7 @@ impl TcpProxy {
         // refines over-allow when the cache matched a shared CDN IP;
         // CacheOnly is the non-TLS fallback path so Domain rules still
         // gate plain HTTP / SSH / etc.
-        if network_policy.has_domain_rules() {
+        if network_policy.has_domain_rules() && !host_destination {
             let source = match sni.as_deref() {
                 Some(name) => HostnameSource::Sni(name),
                 None => HostnameSource::CacheOnly,
