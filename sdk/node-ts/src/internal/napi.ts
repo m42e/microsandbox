@@ -55,6 +55,7 @@ export interface NativeBindings {
   readonly SecretBuilder: NapiBuilderCtor<NapiSecretBuilder>;
   readonly NetworkBuilder: NapiBuilderCtor<NapiNetworkBuilder>;
   readonly OutboundProxyBuilder: NapiBuilderCtor<NapiOutboundProxyBuilder>;
+  readonly HttpConnectProxyBuilder: { prototype: NapiHttpConnectProxyBuilder };
   readonly Socks4ProxyBuilder: { prototype: NapiSocks4ProxyBuilder };
   readonly Socks5ProxyBuilder: { prototype: NapiSocks5ProxyBuilder };
   readonly NetworkPolicyBuilder: NapiBuilderCtor<NapiNetworkPolicyBuilder>;
@@ -225,7 +226,7 @@ export interface NapiSandboxBuilderSetters {
   proxy(
     configure: (
       b: NapiOutboundProxyBuilder,
-    ) => NapiSocks4ProxyBuilder | NapiSocks5ProxyBuilder,
+    ) => NapiHttpConnectProxyBuilder | NapiSocks4ProxyBuilder | NapiSocks5ProxyBuilder,
   ): this;
   port(host: number, guest: number): this;
   portBind(bind: string, host: number, guest: number): this;
@@ -1137,8 +1138,13 @@ export interface NapiNetworkBuilder {
 }
 
 export interface NapiOutboundProxyBuilder {
+  httpConnect(address: string): NapiHttpConnectProxyBuilder;
   socks4(address: string): NapiSocks4ProxyBuilder;
   socks5(address: string): NapiSocks5ProxyBuilder;
+}
+
+export interface NapiHttpConnectProxyBuilder {
+  readonly __httpConnectProxy?: never;
 }
 
 export interface NapiSocks4ProxyBuilder {

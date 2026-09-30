@@ -1610,7 +1610,7 @@ class SecretSource:
 class OutboundProxy:
     """Proxy used for outbound sandbox connections."""
 
-    protocol: Literal["socks4", "socks5"]
+    protocol: Literal["http_connect", "socks4", "socks5"]
     address: str
     user_id: str | None = None
     username: str | None = None
@@ -1623,6 +1623,11 @@ class OutboundProxy:
             raise ValueError("credentials are only supported for SOCKS5 proxies")
         if (self.username is None) != (self.password is None):
             raise ValueError("SOCKS5 username and password must be provided together")
+
+    @classmethod
+    def http_connect(cls, address: str) -> OutboundProxy:
+        """Create an HTTP CONNECT outbound proxy."""
+        return cls(protocol="http_connect", address=address)
 
     @classmethod
     def socks4(cls, address: str, *, user_id: str | None = None) -> OutboundProxy:

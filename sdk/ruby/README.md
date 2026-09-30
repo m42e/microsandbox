@@ -174,6 +174,11 @@ the real value only for the allowed TLS hostname. Secret values persist in
 host-side sandbox configuration, so load them from a secret manager, never log
 them, and rotate them after suspected host compromise.
 
+Route outbound TCP through an HTTP CONNECT proxy with
+`proxy: Microsandbox::OutboundProxy.http_connect("127.0.0.1:3128")`. The
+microsandbox host resolves and checks each destination before opening the
+tunnel. HTTP CONNECT proxy authentication and UDP are not supported.
+
 ## Snapshots
 
 Snapshot operations use the selected backend and preserve whether a snapshot

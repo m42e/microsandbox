@@ -622,12 +622,17 @@ export type JsNetworkRateLimiterBuilder = NetworkRateLimiterBuilder
 /** Selects the protocol for an outbound proxy. */
 export declare class OutboundProxyBuilder {
   constructor()
+  /** Select an HTTP CONNECT proxy at `address`. */
+  httpConnect(address: string): HttpConnectProxyBuilder
   /** Select a SOCKS4 proxy at `address`. */
   socks4(address: string): Socks4ProxyBuilder
   /** Select a SOCKS5 proxy at `address`. */
   socks5(address: string): Socks5ProxyBuilder
 }
 export type JsOutboundProxyBuilder = OutboundProxyBuilder
+
+/** Builds an HTTP CONNECT outbound proxy. */
+export declare class HttpConnectProxyBuilder {}
 
 /** Fluent builder for an ordered list of pre-boot rootfs patches. */
 export declare class PatchBuilder {
@@ -1326,7 +1331,7 @@ export declare class SandboxBuilder {
   /** Configure networking via a callback. */
   network(configure: (arg: NetworkBuilder) => NetworkBuilder): this
   /** Configure the single proxy used for outbound sandbox connections. */
-  proxy(configure: (arg: OutboundProxyBuilder) => Socks4ProxyBuilder | Socks5ProxyBuilder): this
+  proxy(configure: (arg: OutboundProxyBuilder) => HttpConnectProxyBuilder | Socks4ProxyBuilder | Socks5ProxyBuilder): this
   /** Publish a TCP port from host -> guest. */
   port(hostPort: number, guestPort: number): this
   /** Publish a TCP port from host -> guest on a specific host bind address. */

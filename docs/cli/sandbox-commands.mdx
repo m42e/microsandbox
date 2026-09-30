@@ -164,9 +164,10 @@ NAT64 destinations inside the well-known `64:ff9b::/96` prefix are classified by
 
 <Tooltip tip="User-configured outbound proxies are not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
-Use `--proxy` with `msb run` or `msb create` to configure one SOCKS proxy:
+Use `--proxy` with `msb run` or `msb create` to configure one HTTP CONNECT, SOCKS4, or SOCKS5 proxy:
 
 ```bash
+msb run alpine --proxy http://127.0.0.1:3128
 msb run alpine --proxy socks4://127.0.0.1:1080
 msb run alpine --proxy socks4://127.0.0.1:1080 \
   --socks4-user-id sandbox
@@ -177,7 +178,7 @@ msb run alpine --proxy socks5://127.0.0.1:1080 \
   --socks5-password-env SOCKS5_PASSWORD
 ```
 
-SOCKS4 supports TCP; SOCKS5 also supports non-DNS UDP. SOCKS5 authentication requires both flags and reads the password from the host environment at startup. Proxy URLs cannot contain credentials, paths, queries, or fragments. See [Proxies](/networking/outbound-proxy).
+HTTP CONNECT and SOCKS4 support TCP; SOCKS5 also supports non-DNS UDP. HTTP CONNECT does not support authentication. SOCKS5 authentication requires both flags and reads the password from the host environment at startup. Proxy URLs cannot contain credentials, paths, queries, or fragments. See [Proxies](/networking/outbound-proxy).
 
 ### Network rule syntax
 

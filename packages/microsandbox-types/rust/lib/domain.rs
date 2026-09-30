@@ -679,6 +679,13 @@ pub struct NetworkSpec {
 #[serde(tag = "protocol", rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum OutboundProxy {
+    /// An HTTP proxy that opens TCP tunnels with CONNECT.
+    #[serde(rename = "http_connect")]
+    HttpConnect {
+        /// Proxy socket address.
+        address: String,
+    },
+
     /// A SOCKS4 proxy at the given `IP:port` address.
     Socks4 {
         /// Proxy socket address.
