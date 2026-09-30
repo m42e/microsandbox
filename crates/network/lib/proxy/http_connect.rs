@@ -2,10 +2,6 @@
 
 use std::net::AddrParseError;
 
-use super::types::{
-    OutboundProxy, OutboundProxyBuildError, OutboundProxyConfig, OutboundProxyProtocol,
-};
-
 #[cfg(feature = "engine")]
 use std::{io, net::SocketAddr, time::Duration};
 #[cfg(feature = "engine")]
@@ -14,6 +10,10 @@ use tokio::{
     net::TcpStream,
     time::timeout,
 };
+use super::types::{
+    OutboundProxy, OutboundProxyBuildError, OutboundProxyConfig, OutboundProxyProtocol,
+};
+
 
 //--------------------------------------------------------------------------------------------------
 // Constants
