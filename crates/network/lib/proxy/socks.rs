@@ -984,9 +984,17 @@ mod tests {
 
     #[test]
     fn uri_parses_and_formats_for_cli() {
+        let http: OutboundProxy = "http://127.0.0.1:1080".parse().unwrap();
         let socks4: OutboundProxy = "socks4://127.0.0.1:1080".parse().unwrap();
         let socks5: OutboundProxy = "socks5://127.0.0.1:1080".parse().unwrap();
 
+        assert_eq!(
+            http,
+            OutboundProxy::HttpConnect {
+                address: "127.0.0.1:1080".parse().unwrap(),
+            }
+        );
+        assert_eq!(http.to_string(), "http://127.0.0.1:1080");
         assert_eq!(
             socks4,
             OutboundProxy::Socks4 {
@@ -1009,7 +1017,7 @@ mod tests {
     fn uri_rejects_unsupported_forms() {
         for raw in [
             "127.0.0.1:1080",
-            "http://127.0.0.1:1080",
+            "ftp://127.0.0.1:1080",
             "socks4://user@127.0.0.1:1080",
             "socks5://user@127.0.0.1:1080",
             "socks5://127.0.0.1:1080/path",
