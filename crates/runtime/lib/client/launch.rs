@@ -71,6 +71,10 @@ pub struct LaunchCapabilities {
     /// HTTP CONNECT outbound proxies are supported. Older runtimes omit this capability.
     #[serde(default)]
     pub http_connect_proxy: bool,
+
+    /// The guest-facing policy proxy can preserve hostnames for upstream DNS resolution.
+    #[serde(default)]
+    pub http_connect_proxy_dns: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.

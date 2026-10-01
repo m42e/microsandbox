@@ -57,6 +57,8 @@ pub(crate) struct TlsProxy {
     expected_sni: Option<String>,
     /// `true` when the connection arrived via HTTP CONNECT; skips the DNS-cache pin check.
     via_connect: bool,
+    /// The CONNECT authority is checked by hostname because upstream DNS is opaque.
+    proxy_dns_hostname: bool,
     /// ClientHello bytes already consumed from the guest stream.
     initial_buf: Vec<u8>,
 }
@@ -94,6 +96,7 @@ impl TlsProxy {
             upstream_stream: None,
             expected_sni: None,
             via_connect: false,
+            proxy_dns_hostname: false,
             initial_buf: Vec::new(),
         }
     }
@@ -114,6 +117,12 @@ impl TlsProxy {
     /// Seed the proxy with ClientHello bytes already read from the guest.
     pub(crate) fn with_initial_buf(mut self, initial_buf: Vec<u8>) -> Self {
         self.initial_buf = initial_buf;
+        self
+    }
+
+    /// Evaluate egress policy against the CONNECT hostname without a local DNS cache binding.
+    pub(crate) fn with_proxy_dns_hostname(mut self) -> Self {
+        self.proxy_dns_hostname = true;
         self
     }
 
@@ -151,6 +160,7 @@ impl TlsProxy {
             outbound_proxy,
             expected_sni,
             via_connect,
+            proxy_dns_hostname,
             initial_buf,
         } = self;
         let connect_dst = connect_target.primary();
@@ -183,13 +193,22 @@ impl TlsProxy {
         }
 
         // Apply Domain / DomainSuffix rules against the SNI.
-        let eval = network_policy.evaluate_egress_with_source(
-            guest_dst,
-            Protocol::Tcp,
-            &shared,
-            HostnameSource::Sni(&sni_name),
-        );
-        if !matches!(eval, EgressEvaluation::Allow) {
+        let policy_allows = if proxy_dns_hostname {
+            network_policy
+                .evaluate_proxy_hostname(&sni_name, Protocol::Tcp, guest_dst.port())
+                .is_allow()
+        } else {
+            matches!(
+                network_policy.evaluate_egress_with_source(
+                    guest_dst,
+                    Protocol::Tcp,
+                    &shared,
+                    HostnameSource::Sni(&sni_name),
+                ),
+                EgressEvaluation::Allow
+            )
+        };
+        if !policy_allows {
             tracing::debug!(
                 sni = %sni_name,
                 dst = %guest_dst,
@@ -219,12 +238,20 @@ impl TlsProxy {
         let should_bypass = tls_state.should_bypass(&sni_name);
         if strict
             && should_bypass
-            && network_policy.allows_egress_via_hostname(
-                guest_dst,
-                Protocol::Tcp,
-                &shared,
-                HostnameSource::Sni(&sni_name),
-            )
+            && if proxy_dns_hostname {
+                network_policy.allows_proxy_hostname_via_domain(
+                    &sni_name,
+                    Protocol::Tcp,
+                    guest_dst.port(),
+                )
+            } else {
+                network_policy.allows_egress_via_hostname(
+                    guest_dst,
+                    Protocol::Tcp,
+                    &shared,
+                    HostnameSource::Sni(&sni_name),
+                )
+            }
         {
             tracing::debug!(
                 sni = %sni_name,
