@@ -17,6 +17,8 @@ use crate::engine::tls::{proxy::TlsProxy, state::TlsState};
 use crate::netstack::shared::SharedState;
 use crate::policy::{NetworkPolicy, Protocol};
 use crate::proxy::HttpConnectProtocol;
+use crate::secrets::config::{SecretViolationAction, SecretsConfig};
+use crate::secrets::handler::SecretsHandler;
 use crate::tcp::connection::ProxyConnectState;
 use crate::tcp::upstream::UpstreamTcpTarget;
 
@@ -46,6 +48,7 @@ struct ParsedRequest {
     expect_continue: bool,
 }
 
+#[derive(Clone)]
 struct Target {
     host: String,
     port: u16,
@@ -64,6 +67,7 @@ enum RequestBodyFraming {
 //--------------------------------------------------------------------------------------------------
 
 /// Serve a guest connection to the sandbox-local HTTP proxy.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_connection(
     from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
@@ -71,6 +75,7 @@ pub(crate) fn spawn_connection(
     network_policy: Arc<NetworkPolicy>,
     platform_policy: Option<Arc<NetworkPolicy>>,
     tls_state: Option<Arc<TlsState>>,
+    secrets: Arc<SecretsConfig>,
     strict: bool,
     shared: Arc<SharedState>,
     handle: &tokio::runtime::Handle,
@@ -80,33 +85,30 @@ pub(crate) fn spawn_connection(
         let (proxy_stream, bridge_stream) = tokio::io::duplex(128 * 1024);
         let (mut proxy_read, mut proxy_write) = tokio::io::split(proxy_stream);
         let mut proxy_guest_rx = from_smoltcp;
-        let mut proxy_guest_tx = to_smoltcp;
+        let proxy_guest_tx = to_smoltcp;
         let guest_shared = shared.clone();
-        let bridge = runtime.spawn(async move {
-            let guest_to_proxy = async {
-                while let Some(bytes) = proxy_guest_rx.recv().await {
-                    proxy_write.write_all(&bytes).await?;
+        let guest_to_proxy = runtime.spawn(async move {
+            while let Some(bytes) = proxy_guest_rx.recv().await {
+                proxy_write.write_all(&bytes).await?;
+            }
+            proxy_write.shutdown().await
+        });
+        let proxy_to_guest = runtime.spawn(async move {
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                let count = proxy_read.read(&mut buffer).await?;
+                if count == 0 {
+                    return Ok::<(), io::Error>(());
                 }
-                proxy_write.shutdown().await
-            };
-            let proxy_to_guest = async {
-                let mut buffer = [0u8; 16 * 1024];
-                loop {
-                    let count = proxy_read.read(&mut buffer).await?;
-                    if count == 0 {
-                        return Ok::<(), io::Error>(());
-                    }
-                    if proxy_guest_tx
-                        .send(Bytes::copy_from_slice(&buffer[..count]))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    guest_shared.proxy_wake.wake();
+                if proxy_guest_tx
+                    .send(Bytes::copy_from_slice(&buffer[..count]))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
                 }
-            };
-            tokio::try_join!(guest_to_proxy, proxy_to_guest).map(|_| ())
+                guest_shared.proxy_wake.wake();
+            }
         });
 
         let result = serve(
@@ -115,6 +117,7 @@ pub(crate) fn spawn_connection(
             network_policy,
             platform_policy,
             tls_state,
+            secrets,
             strict,
             shared,
         )
@@ -122,17 +125,20 @@ pub(crate) fn spawn_connection(
         if let Err(error) = result {
             tracing::debug!(%error, "HTTP proxy connection closed");
         }
-        bridge.abort();
-        let _ = bridge.await;
+        guest_to_proxy.abort();
+        let _ = guest_to_proxy.await;
+        let _ = proxy_to_guest.await;
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve<S>(
     mut guest: S,
     upstream_proxy: SocketAddr,
     network_policy: Arc<NetworkPolicy>,
     platform_policy: Option<Arc<NetworkPolicy>>,
     tls_state: Option<Arc<TlsState>>,
+    secrets: Arc<SecretsConfig>,
     strict: bool,
     shared: Arc<SharedState>,
 ) -> io::Result<()>
@@ -141,7 +147,7 @@ where
 {
     let request = read_headers(&mut guest).await?;
     let parsed = parse_request(&request)?;
-    let target = parsed.target;
+    let target = parsed.target.clone();
     let protocol = Protocol::Tcp;
     if !hostname_allowed(
         &target.host,
@@ -151,6 +157,21 @@ where
         protocol,
         &shared,
     ) {
+        guest
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    let intercepts_tls = tls_state
+        .as_ref()
+        .is_some_and(|state| state.config.intercepted_ports.contains(&target.port));
+    if parsed.connect
+        && strict
+        && !intercepts_tls
+        && target.host.parse::<IpAddr>().is_err()
+        && network_policy.allows_proxy_hostname_via_domain(&target.host, Protocol::Tcp, target.port)
+    {
         guest
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             .await?;
@@ -176,9 +197,7 @@ where
     if parsed.connect {
         let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
         guest.write_all(response).await?;
-        if let Some(tls_state) =
-            tls_state.filter(|state| state.config.intercepted_ports.contains(&target.port))
-        {
+        if let Some(tls_state) = tls_state.filter(|_| intercepts_tls) {
             return run_tls_mitm(
                 guest,
                 upstream,
@@ -196,51 +215,287 @@ where
             upstream.write_all(&parsed.body).await?;
         }
     } else {
-        let authority_host = if target.host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{}]", target.host)
-        } else {
-            target.host.clone()
-        };
-        let absolute_uri = format!("http://{authority_host}:{}{}", target.port, target.path);
-        let first_line = rewrite_request_line(&parsed.request_line, &absolute_uri)?;
-        upstream.write_all(&first_line).await?;
-        upstream
-            .write_all(&upstream_request_headers(&parsed.header_tail)?)
-            .await?;
-        if parsed.expect_continue {
-            guest.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-        }
-        let mut body_offset = 0;
-        match parsed.body_framing {
-            RequestBodyFraming::None => {}
-            RequestBodyFraming::Length(length) => {
-                copy_request_bytes(
-                    &mut guest,
-                    &parsed.body,
-                    &mut body_offset,
-                    length,
-                    &mut upstream,
-                )
-                .await?;
-            }
-            RequestBodyFraming::Chunked => {
-                copy_chunked_request_body(
-                    &mut guest,
-                    &parsed.body,
-                    &mut body_offset,
-                    &mut upstream,
-                )
-                .await?;
-            }
-        }
-        upstream.flush().await?;
-        tokio::io::copy(&mut upstream, &mut guest).await?;
-        guest.shutdown().await?;
-        return Ok(());
+        return serve_plain_http_request(guest, upstream, parsed, secrets, network_policy, shared)
+            .await;
     }
     upstream.flush().await?;
     tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
     Ok(())
+}
+
+async fn serve_plain_http_request<S>(
+    guest: S,
+    upstream: TcpStream,
+    parsed: ParsedRequest,
+    secrets: Arc<SecretsConfig>,
+    network_policy: Arc<NetworkPolicy>,
+    shared: Arc<SharedState>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let ParsedRequest {
+        target,
+        request_line,
+        header_tail,
+        body,
+        body_framing,
+        expect_continue,
+        ..
+    } = parsed;
+    let mut request_headers = request_line;
+    request_headers.extend_from_slice(&header_tail);
+    let mut secrets_handler = (!secrets.secrets.is_empty()).then(|| {
+        SecretsHandler::new_plain_http_proxy_dns(
+            &secrets,
+            &target.host,
+            target.port,
+            network_policy,
+            shared.clone(),
+        )
+    });
+    let outgoing_headers = match secrets_handler.as_mut() {
+        Some(handler) => substitute_secret_bytes(handler, &request_headers, &shared)?,
+        None => request_headers,
+    };
+
+    let (mut guest_read, mut guest_write) = tokio::io::split(guest);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+    let mut headers_sent = !outgoing_headers.is_empty();
+    if headers_sent {
+        write_upstream_request_headers(&outgoing_headers, &mut upstream_write).await?;
+    }
+    if expect_continue {
+        guest_write
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await?;
+    }
+
+    let mut body_offset = 0;
+    let request_task = forward_request_body(
+        &mut guest_read,
+        &body,
+        &mut body_offset,
+        body_framing,
+        &mut secrets_handler,
+        &mut headers_sent,
+        &shared,
+        &mut upstream_write,
+    );
+    let response_task = async {
+        tokio::io::copy(&mut upstream_read, &mut guest_write).await?;
+        guest_write.shutdown().await
+    };
+    tokio::pin!(request_task);
+    tokio::pin!(response_task);
+
+    tokio::select! {
+        response = &mut response_task => response?,
+        request = &mut request_task => {
+            if let Err(error) = request {
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) {
+                    return Err(error);
+                }
+                tracing::debug!(%error, "upstream stopped accepting an HTTP request body");
+            }
+            response_task.await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_request_body<R, W>(
+    guest: &mut R,
+    initial: &[u8],
+    initial_offset: &mut usize,
+    framing: RequestBodyFraming,
+    secrets_handler: &mut Option<SecretsHandler>,
+    headers_sent: &mut bool,
+    shared: &SharedState,
+    upstream: &mut W,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match framing {
+        RequestBodyFraming::None => {}
+        RequestBodyFraming::Length(mut remaining) => {
+            let mut buffer = [0u8; 16 * 1024];
+            while remaining > 0 {
+                let count = remaining.min(buffer.len());
+                read_request_exact(guest, initial, initial_offset, &mut buffer[..count]).await?;
+                forward_request_data(
+                    &buffer[..count],
+                    secrets_handler,
+                    headers_sent,
+                    shared,
+                    upstream,
+                )
+                .await?;
+                remaining -= count;
+            }
+        }
+        RequestBodyFraming::Chunked => {
+            let mut trailer_bytes = 0;
+            'body: loop {
+                let line = read_request_line(guest, initial, initial_offset).await?;
+                let size_text = line
+                    .strip_suffix(b"\r\n")
+                    .unwrap_or(&line)
+                    .split(|byte| *byte == b';')
+                    .next()
+                    .unwrap_or_default();
+                let size = std::str::from_utf8(trim_ascii(size_text))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP chunk size")
+                    })
+                    .and_then(|size| {
+                        u64::from_str_radix(size, 16).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP chunk size")
+                        })
+                    })?;
+                forward_request_data(&line, secrets_handler, headers_sent, shared, upstream)
+                    .await?;
+                if size == 0 {
+                    loop {
+                        let trailer = read_request_line(guest, initial, initial_offset).await?;
+                        trailer_bytes += trailer.len();
+                        if trailer_bytes > MAX_HEADERS {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "HTTP chunk trailers too large",
+                            ));
+                        }
+                        forward_request_data(
+                            &trailer,
+                            secrets_handler,
+                            headers_sent,
+                            shared,
+                            upstream,
+                        )
+                        .await?;
+                        if trailer == b"\r\n" {
+                            break 'body;
+                        }
+                    }
+                }
+
+                let mut remaining = usize::try_from(size).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "HTTP chunk size is too large")
+                })?;
+                let mut buffer = [0u8; 16 * 1024];
+                while remaining > 0 {
+                    let count = remaining.min(buffer.len());
+                    read_request_exact(guest, initial, initial_offset, &mut buffer[..count])
+                        .await?;
+                    forward_request_data(
+                        &buffer[..count],
+                        secrets_handler,
+                        headers_sent,
+                        shared,
+                        upstream,
+                    )
+                    .await?;
+                    remaining -= count;
+                }
+                let mut terminator = [0u8; 2];
+                read_request_exact(guest, initial, initial_offset, &mut terminator).await?;
+                if terminator != *b"\r\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid HTTP chunk terminator",
+                    ));
+                }
+                forward_request_data(&terminator, secrets_handler, headers_sent, shared, upstream)
+                    .await?;
+            }
+        }
+    }
+    if !*headers_sent {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secret handler did not produce a complete HTTP request",
+        ));
+    }
+    upstream.flush().await?;
+    upstream.shutdown().await
+}
+
+async fn forward_request_data<W>(
+    data: &[u8],
+    secrets_handler: &mut Option<SecretsHandler>,
+    headers_sent: &mut bool,
+    shared: &SharedState,
+    upstream: &mut W,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let output = match secrets_handler.as_mut() {
+        Some(handler) => substitute_secret_bytes(handler, data, shared)?,
+        None => data.to_vec(),
+    };
+    if output.is_empty() {
+        return Ok(());
+    }
+    if !*headers_sent {
+        let parsed = parse_request(&output)?;
+        write_upstream_request_headers(&output, upstream).await?;
+        upstream.write_all(&parsed.body).await?;
+        *headers_sent = true;
+    } else {
+        upstream.write_all(&output).await?;
+    }
+    Ok(())
+}
+
+async fn write_upstream_request_headers<W>(request: &[u8], upstream: &mut W) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let parsed = parse_request(request)?;
+    let authority_host = if parsed.target.host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]", parsed.target.host)
+    } else {
+        parsed.target.host.clone()
+    };
+    let absolute_uri = format!(
+        "http://{authority_host}:{}{}",
+        parsed.target.port, parsed.target.path
+    );
+    upstream
+        .write_all(&rewrite_request_line(&parsed.request_line, &absolute_uri)?)
+        .await?;
+    upstream
+        .write_all(&upstream_request_headers(&parsed.header_tail)?)
+        .await?;
+    upstream.flush().await
+}
+
+fn substitute_secret_bytes(
+    handler: &mut SecretsHandler,
+    data: &[u8],
+    shared: &SharedState,
+) -> io::Result<Vec<u8>> {
+    match handler.substitute(data) {
+        Ok(output) => Ok(output.into_owned()),
+        Err(action) => {
+            if matches!(action, SecretViolationAction::BlockAndTerminate) {
+                shared.trigger_termination();
+            }
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "secret violation: request blocked by secret policy",
+            ))
+        }
+    }
 }
 
 fn hostname_allowed(
@@ -267,6 +522,7 @@ fn hostname_allowed(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tls_mitm<S>(
     guest: S,
     upstream: TcpStream,
@@ -281,12 +537,16 @@ async fn run_tls_mitm<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let guest_dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let literal_address = hostname.parse::<IpAddr>().ok();
+    let guest_dst = SocketAddr::new(
+        literal_address.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        port,
+    );
     let proxy_connect = Arc::new(ProxyConnectState::new());
     proxy_connect.mark_connected();
     let (guest_tx, guest_rx) = mpsc::channel(32);
     let (proxy_tx, mut proxy_rx) = mpsc::channel(32);
-    let proxy = TlsProxy::new(
+    let mut proxy = TlsProxy::new(
         guest_dst,
         UpstreamTcpTarget::direct(guest_dst),
         guest_rx,
@@ -299,9 +559,14 @@ where
         None,
     )
     .with_upstream(upstream)
-    .with_expected_sni(Some(hostname))
-    .with_initial_buf(initial_buf)
-    .with_proxy_dns_hostname();
+    .with_initial_buf(initial_buf);
+    proxy = if literal_address.is_some() {
+        proxy.with_proxy_dns_address()
+    } else {
+        proxy
+            .with_expected_sni(Some(hostname))
+            .with_proxy_dns_hostname()
+    };
 
     let (mut guest_read, mut guest_write) = tokio::io::split(guest);
     let input_task = tokio::spawn(async move {
@@ -670,7 +935,7 @@ fn parse_request_body_framing(headers: &[u8]) -> io::Result<(RequestBodyFraming,
     let framing = if let Some(encoding) = transfer_encoding {
         if !encoding
             .split(',')
-            .last()
+            .next_back()
             .is_some_and(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
         {
             return Err(io::Error::new(
@@ -708,34 +973,6 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
     value
 }
 
-async fn copy_request_bytes<S>(
-    guest: &mut S,
-    initial: &[u8],
-    initial_offset: &mut usize,
-    mut length: usize,
-    upstream: &mut TcpStream,
-) -> io::Result<()>
-where
-    S: AsyncRead + Unpin,
-{
-    if *initial_offset < initial.len() {
-        let count = length.min(initial.len() - *initial_offset);
-        upstream
-            .write_all(&initial[*initial_offset..*initial_offset + count])
-            .await?;
-        *initial_offset += count;
-        length -= count;
-    }
-    let mut buffer = [0u8; 16 * 1024];
-    while length > 0 {
-        let count = length.min(buffer.len());
-        guest.read_exact(&mut buffer[..count]).await?;
-        upstream.write_all(&buffer[..count]).await?;
-        length -= count;
-    }
-    Ok(())
-}
-
 async fn read_request_line<S>(
     guest: &mut S,
     initial: &[u8],
@@ -765,64 +1002,6 @@ where
                 "HTTP chunk header too large",
             ));
         }
-    }
-}
-
-async fn copy_chunked_request_body<S>(
-    guest: &mut S,
-    initial: &[u8],
-    initial_offset: &mut usize,
-    upstream: &mut TcpStream,
-) -> io::Result<()>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut trailer_bytes = 0;
-    loop {
-        let line = read_request_line(guest, initial, initial_offset).await?;
-        let size_text = line
-            .strip_suffix(b"\r\n")
-            .unwrap_or(&line)
-            .split(|byte| *byte == b';')
-            .next()
-            .unwrap_or_default();
-        let size = std::str::from_utf8(trim_ascii(size_text))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP chunk size"))
-            .and_then(|size| {
-                u64::from_str_radix(size, 16).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP chunk size")
-                })
-            })?;
-        upstream.write_all(&line).await?;
-        if size == 0 {
-            loop {
-                let trailer = read_request_line(guest, initial, initial_offset).await?;
-                trailer_bytes += trailer.len();
-                if trailer_bytes > MAX_HEADERS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "HTTP chunk trailers too large",
-                    ));
-                }
-                upstream.write_all(&trailer).await?;
-                if trailer == b"\r\n" {
-                    return Ok(());
-                }
-            }
-        }
-        let size = usize::try_from(size).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "HTTP chunk size is too large")
-        })?;
-        copy_request_bytes(guest, initial, initial_offset, size, upstream).await?;
-        let mut terminator = [0u8; 2];
-        read_request_exact(guest, initial, initial_offset, &mut terminator).await?;
-        if terminator != *b"\r\n" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid HTTP chunk terminator",
-            ));
-        }
-        upstream.write_all(&terminator).await?;
     }
 }
 

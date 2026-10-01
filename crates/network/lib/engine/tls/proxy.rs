@@ -59,6 +59,8 @@ pub(crate) struct TlsProxy {
     via_connect: bool,
     /// The CONNECT authority is checked by hostname because upstream DNS is opaque.
     proxy_dns_hostname: bool,
+    /// The CONNECT authority is an IP literal and must use address policy.
+    proxy_dns_address: bool,
     /// ClientHello bytes already consumed from the guest stream.
     initial_buf: Vec<u8>,
 }
@@ -97,6 +99,7 @@ impl TlsProxy {
             expected_sni: None,
             via_connect: false,
             proxy_dns_hostname: false,
+            proxy_dns_address: false,
             initial_buf: Vec::new(),
         }
     }
@@ -123,6 +126,12 @@ impl TlsProxy {
     /// Evaluate egress policy against the CONNECT hostname without a local DNS cache binding.
     pub(crate) fn with_proxy_dns_hostname(mut self) -> Self {
         self.proxy_dns_hostname = true;
+        self
+    }
+
+    /// Evaluate an IP-literal CONNECT target using its address policy.
+    pub(crate) fn with_proxy_dns_address(mut self) -> Self {
+        self.proxy_dns_address = true;
         self
     }
 
@@ -161,6 +170,7 @@ impl TlsProxy {
             expected_sni,
             via_connect,
             proxy_dns_hostname,
+            proxy_dns_address,
             initial_buf,
         } = self;
         let connect_dst = connect_target.primary();
@@ -196,6 +206,10 @@ impl TlsProxy {
         let policy_allows = if proxy_dns_hostname {
             network_policy
                 .evaluate_proxy_hostname(&sni_name, Protocol::Tcp, guest_dst.port())
+                .is_allow()
+        } else if proxy_dns_address {
+            network_policy
+                .evaluate_egress(guest_dst, Protocol::Tcp, &shared)
                 .is_allow()
         } else {
             matches!(
@@ -238,7 +252,9 @@ impl TlsProxy {
         let should_bypass = tls_state.should_bypass(&sni_name);
         if strict
             && should_bypass
-            && if proxy_dns_hostname {
+            && if proxy_dns_address {
+                false
+            } else if proxy_dns_hostname {
                 network_policy.allows_proxy_hostname_via_domain(
                     &sni_name,
                     Protocol::Tcp,

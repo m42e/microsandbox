@@ -601,6 +601,7 @@ pub fn smoltcp_poll_loop(
                     network_policy.clone(),
                     platform_policy.clone(),
                     tls_state.clone(),
+                    secrets.load(),
                     strict,
                     shared.clone(),
                     &tokio_handle,
