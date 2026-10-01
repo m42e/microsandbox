@@ -30,6 +30,10 @@ pub(crate) enum OutboundProxySelection {
     Socks5(RustSocks5ProxyBuilder),
 }
 
+/// Builds an HTTP CONNECT outbound proxy.
+#[napi(js_name = "HttpConnectProxyBuilder")]
+pub struct JsHttpConnectProxyBuilder {}
+
 /// Builds a SOCKS4 outbound proxy.
 #[napi(js_name = "Socks4ProxyBuilder")]
 pub struct JsSocks4ProxyBuilder {
@@ -80,9 +84,7 @@ impl JsOutboundProxyBuilder {
             .replace(Some(OutboundProxySelection::HttpConnect(
                 builder.http_connect(address),
             )));
-        Ok(JsHttpConnectProxyBuilder {
-            selection: Rc::clone(&self.selection),
-        })
+        Ok(JsHttpConnectProxyBuilder {})
     }
 
     /// Select a SOCKS4 proxy at `address`.
@@ -114,12 +116,6 @@ impl JsOutboundProxyBuilder {
             selection: Rc::clone(&self.selection),
         })
     }
-}
-
-/// Builds an HTTP CONNECT outbound proxy.
-#[napi(js_name = "HttpConnectProxyBuilder")]
-pub struct JsHttpConnectProxyBuilder {
-    selection: SharedOutboundProxySelection,
 }
 
 #[napi]

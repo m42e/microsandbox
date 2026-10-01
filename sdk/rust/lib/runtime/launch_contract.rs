@@ -87,6 +87,21 @@ impl LaunchContract {
         if self.machine && network.tcp_accept_queue_size.is_some() {
             require_tcp_accept_queue_size(msb_path).await?;
         }
+
+        if self.machine
+            && matches!(
+                network.outbound_proxy,
+                Some(microsandbox_network::OutboundProxy::HttpConnect { .. })
+            )
+        {
+            require_capability(
+                msb_path,
+                |capabilities| capabilities.http_connect_proxy,
+                "HTTP CONNECT outbound proxies",
+            )
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -104,6 +119,16 @@ impl LaunchContract {
         if self.machine {
             return Ok(());
         }
+
+        if matches!(
+            network.outbound_proxy,
+            Some(microsandbox_network::OutboundProxy::HttpConnect { .. })
+        ) {
+            return Err(MicrosandboxError::Runtime(upgrade_required(
+                "HTTP CONNECT outbound proxies",
+            )));
+        }
+
         if network.max_udp_connections.is_some() {
             return unsupported("UDP connection limits");
         }
@@ -841,6 +866,71 @@ mod tests {
             .require_network_capabilities(&absent, &tuned)
             .await
             .unwrap();
+    }
+
+    #[cfg(all(unix, feature = "net"))]
+    #[tokio::test]
+    async fn http_connect_requires_runtime_support_before_launch() {
+        use microsandbox_network::config::NetworkConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network: NetworkConfig = serde_json::from_value(json!({
+            "outbound_proxy": {"protocol": "http_connect", "address": "127.0.0.1:3128"}
+        }))
+        .unwrap();
+        let machine = LaunchContract {
+            patch: 18,
+            machine: true,
+        };
+
+        for response in [
+            r#"printf '%s' '{"protocols":[2,1]}'"#,
+            r#"printf '%s' '{"protocols":[2,1],"http_connect_proxy":false}'"#,
+            r#"printf '%s' '{"protocols":[1],"http_connect_proxy":true}'"#,
+        ] {
+            let old = script(dir.path(), "unsupported-http-connect", response);
+            let error = machine
+                .require_network_capabilities(&old, &network)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("HTTP CONNECT"), "{error}");
+            assert!(error.to_string().contains("upgrade msb"), "{error}");
+        }
+
+        let supported = script(
+            dir.path(),
+            "supported-http-connect",
+            r#"printf '%s' '{"protocols":[2,1],"http_connect_proxy":true}'"#,
+        );
+        machine
+            .require_network_capabilities(&supported, &network)
+            .await
+            .unwrap();
+
+        for patch in [17, 18] {
+            let legacy = LaunchContract {
+                patch,
+                machine: false,
+            };
+            let error = legacy
+                .validate_network(&network, Default::default())
+                .unwrap_err();
+            assert!(error.to_string().contains("HTTP CONNECT"), "{error}");
+        }
+
+        for proxy in [None, Some("socks4"), Some("socks5")] {
+            let network: NetworkConfig = serde_json::from_value(json!({
+                "outbound_proxy": proxy.map(|protocol| json!({
+                    "protocol": protocol,
+                    "address": "127.0.0.1:1080"
+                }))
+            }))
+            .unwrap();
+            machine
+                .require_network_capabilities(&dir.path().join("absent-msb"), &network)
+                .await
+                .unwrap();
+        }
     }
 
     #[cfg(all(unix, feature = "net"))]

@@ -67,6 +67,10 @@ pub struct LaunchCapabilities {
     /// Older runtimes omit this capability.
     #[serde(default)]
     pub http_deny_message: bool,
+
+    /// HTTP CONNECT outbound proxies are supported. Older runtimes omit this capability.
+    #[serde(default)]
+    pub http_connect_proxy: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.

@@ -75,6 +75,8 @@ SDK addresses use `IP:port`. The `msb run` and `msb create` commands accept `--p
 
 HTTP CONNECT opens a TCP tunnel through an HTTP proxy. It does not support proxy authentication or UDP. microsandbox resolves and checks the destination using its normal DNS and egress policy before sending the destination IP and port in the CONNECT request. The proxy address itself must be an IP address with a port.
 
+The selected `msb` runtime must support HTTP CONNECT. When using an older runtime, the SDK requests an upgrade before creating or replacing a sandbox.
+
 <CodeGroup>
 ```typescript TypeScript
 .proxy((p) => p.httpConnect("127.0.0.1:3128"))

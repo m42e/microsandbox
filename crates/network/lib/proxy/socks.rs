@@ -16,6 +16,8 @@ use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks4Stream;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "engine")]
+use super::http_connect::HttpConnectProtocol;
 use super::types::{
     OutboundProxy, OutboundProxyBuildError, OutboundProxyBuilder, OutboundProxyConfig,
     OutboundProxyProtocol, ResolvedOutboundProxy,
@@ -155,7 +157,7 @@ impl ResolvedOutboundProxy {
     pub(crate) async fn connect(&self, destination: SocketAddr) -> io::Result<TcpStream> {
         match self {
             Self::HttpConnect { address } => {
-                super::http_connect::connect(*address, destination).await
+                HttpConnectProtocol::connect(*address, destination).await
             }
             Self::Socks4 { address, user_id } => match user_id {
                 Some(user_id) => {
