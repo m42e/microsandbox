@@ -1,5 +1,12 @@
 //! Regression coverage for TLS over the guest-facing HTTP proxy.
 
+use std::{
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
+
+use tokio::io::ReadBuf;
 use tokio::net::TcpListener;
 
 use crate::secrets::{
@@ -9,6 +16,48 @@ use crate::secrets::{
 use crate::tcp::connection::ProxyConnectStatus;
 
 use super::*;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct BrokenGuest {
+    dropped: Arc<AtomicBool>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl AsyncRead for BrokenGuest {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for BrokenGuest {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for BrokenGuest {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -294,4 +343,150 @@ async fn secrets_reject_ip_connect_sni_bypass() {
     let mut bytes = Vec::new();
     server.read_to_end(&mut bytes).await.unwrap();
     assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn tls_output_failure_returns_error_and_cleans_up_guest() {
+    let (upstream, _server) = upstream_pair().await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(run_tls_mitm(
+        BrokenGuest {
+            dropped: dropped.clone(),
+        },
+        upstream,
+        "example.com".into(),
+        443,
+        client_hello("example.com"),
+        Arc::new(NetworkPolicy::allow_all()),
+        tls_state(),
+        true,
+        Arc::new(SharedState::new(32)),
+    ));
+    let error = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn tls_input_eof_returns_error_without_polling_completed_output_twice() {
+    for _ in 0..16 {
+        let (upstream, _server) = upstream_pair().await;
+        let (mut client, guest) = tokio::io::duplex(4096);
+        client.shutdown().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_tls_mitm(
+                guest,
+                upstream,
+                "example.com".into(),
+                443,
+                client_hello("example.com"),
+                Arc::new(NetworkPolicy::allow_all()),
+                tls_state(),
+                true,
+                Arc::new(SharedState::new(32)),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(!response.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn intercepted_connect_substitutes_secrets_and_finishes_tasks() {
+    let host = "secret.example";
+    let tls = tls_state_with_config(
+        microsandbox_types::TlsConfig {
+            enabled: true,
+            verify_upstream: false,
+            ..Default::default()
+        },
+        blocking_secrets(SecretViolationAction::BlockAndTerminate),
+    );
+    let server_config = tls
+        .get_or_generate_cert(host)
+        .unwrap()
+        .server_config
+        .clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_headers(&mut stream).await.unwrap();
+        assert!(request.starts_with(b"CONNECT secret.example:443 HTTP/1.1\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let mut stream = tokio_rustls::TlsAcceptor::from(server_config)
+            .accept(stream)
+            .await
+            .unwrap();
+        let request = read_headers(&mut stream).await.unwrap();
+        assert!(String::from_utf8_lossy(&request).contains("Authorization: Bearer real-value\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let (mut client, guest) = tokio::io::duplex(128 * 1024);
+    let proxy = tokio::spawn(serve(
+        guest,
+        address,
+        Arc::new(NetworkPolicy::allow_all()),
+        None,
+        Some(tls.clone()),
+        tls.secrets.load(),
+        true,
+        Arc::new(SharedState::new(32)),
+    ));
+    client
+        .write_all(b"CONNECT secret.example:443 HTTP/1.1\r\nHost: secret.example:443\r\n\r\n")
+        .await
+        .unwrap();
+    let response = read_headers(&mut client).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 Connection Established"));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(tls.intercept_ca.cert_der.clone()).unwrap();
+    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let mut client = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+        .connect(
+            rustls::pki_types::ServerName::try_from(host).unwrap(),
+            client,
+        )
+        .await
+        .unwrap();
+    client
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: secret.example\r\nAuthorization: Bearer $TOKEN\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), read_headers(&mut client))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+    tokio::time::timeout(Duration::from_secs(3), proxy)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    upstream.await.unwrap();
 }

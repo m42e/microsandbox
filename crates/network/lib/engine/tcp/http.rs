@@ -1030,15 +1030,33 @@ where
         }
         guest_write.shutdown().await
     });
-    let mut proxy_task = tokio::spawn(proxy.run());
+    let mut proxy_task = tokio::spawn(proxy.try_run());
     let mut output_task = output_task;
-    tokio::select! {
-        _ = &mut proxy_task => {}
-        _ = &mut output_task => proxy_task.abort(),
-    }
+    let result = tokio::select! {
+        proxy_result = &mut proxy_task => {
+            input_task.abort();
+            // Drain already-produced TLS output before closing the guest.
+            let output_result = output_task.await;
+            proxy_result.map_err(io::Error::other).and_then(|result| result)
+                .and(output_result.map_err(io::Error::other).and_then(|result| result))
+        }
+        output_result = &mut output_task => {
+            match output_result {
+                Ok(Ok(())) => {
+                    // A clean output EOF means the TLS proxy dropped its sender.
+                    proxy_task.await.map_err(io::Error::other).and_then(|result| result)
+                }
+                result => {
+                    proxy_task.abort();
+                    let _ = proxy_task.await;
+                    result.map_err(io::Error::other).and_then(|result| result)
+                }
+            }
+        }
+    };
     input_task.abort();
-    let _ = output_task.await;
-    Ok(())
+    let _ = input_task.await;
+    result
 }
 
 async fn read_headers<S>(stream: &mut S) -> io::Result<Vec<u8>>
