@@ -61,6 +61,14 @@ enum RequestBodyFraming {
     Chunked,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseBodyFraming {
+    None,
+    Length(u64),
+    Chunked,
+    CloseDelimited,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("the HTTP proxy accepts only one request per connection")]
 struct PipelinedRequest;
@@ -629,7 +637,12 @@ where
         .unwrap()
         + 2;
     let headers = &response[line_end..];
-    let (framing, _) = parse_request_body_framing(headers)?;
+    let framing = parse_response_body_framing(headers, status, head_request)?;
+    let has_transfer_encoding = headers.split(|byte| *byte == b'\n').any(|line| {
+        line.split(|byte| *byte == b':')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"transfer-encoding"))
+    });
     guest.write_all(&response[..line_end]).await?;
     for line in headers.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -639,29 +652,28 @@ where
         let name = line.split(|byte| *byte == b':').next().unwrap_or_default();
         if !name.eq_ignore_ascii_case(b"connection")
             && !name.eq_ignore_ascii_case(b"proxy-connection")
+            && !(has_transfer_encoding && name.eq_ignore_ascii_case(b"content-length"))
         {
             guest.write_all(line).await?;
             guest.write_all(b"\r\n").await?;
         }
     }
     guest.write_all(b"Connection: close\r\n\r\n").await?;
-    if head_request || matches!(status, 204 | 304) {
-        return Ok(());
-    }
     match framing {
-        RequestBodyFraming::None => {
+        ResponseBodyFraming::None => {}
+        ResponseBodyFraming::CloseDelimited => {
             tokio::io::copy(upstream, guest).await?;
         }
-        RequestBodyFraming::Length(length) => {
-            let count = tokio::io::copy(&mut upstream.take(length as u64), guest).await?;
-            if count != length as u64 {
+        ResponseBodyFraming::Length(length) => {
+            let count = tokio::io::copy(&mut upstream.take(length), guest).await?;
+            if count != length {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "incomplete upstream response body",
                 ));
             }
         }
-        RequestBodyFraming::Chunked => {
+        ResponseBodyFraming::Chunked => {
             let mut trailer_bytes = 0;
             loop {
                 let line = read_request_line(upstream, &[], &mut 0).await?;
@@ -712,6 +724,106 @@ where
         }
     }
     Ok(())
+}
+
+fn parse_response_body_framing(
+    headers: &[u8],
+    status: u16,
+    head_request: bool,
+) -> io::Result<ResponseBodyFraming> {
+    // RFC 9112 section 6.3: bodyless responses take precedence over framing
+    // fields. A response's final non-chunked transfer coding is delimited by
+    // connection close, unlike a request, which must be rejected in that case.
+    if head_request || (100..200).contains(&status) || matches!(status, 204 | 304) {
+        return Ok(ResponseBodyFraming::None);
+    }
+    let mut content_lengths = Vec::new();
+    let mut transfer_codings = Vec::new();
+    for line in headers.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed upstream response header",
+            )
+        })?;
+        let name = &line[..colon];
+        let value = trim_ascii(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"content-length") {
+            content_lengths.push(value);
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            let value = std::str::from_utf8(value).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid response Transfer-Encoding",
+                )
+            })?;
+            for coding in value.split(',') {
+                let coding = coding.trim();
+                if coding.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty response transfer coding",
+                    ));
+                }
+                transfer_codings.push(coding);
+            }
+        }
+    }
+    if let Some(final_coding) = transfer_codings.last() {
+        if transfer_codings[..transfer_codings.len() - 1]
+            .iter()
+            .any(|coding| coding.eq_ignore_ascii_case("chunked"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked must be the final response transfer coding",
+            ));
+        }
+        return Ok(if final_coding.eq_ignore_ascii_case("chunked") {
+            ResponseBodyFraming::Chunked
+        } else {
+            ResponseBodyFraming::CloseDelimited
+        });
+    }
+    let mut length = None;
+    for value in content_lengths {
+        let value = std::str::from_utf8(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid response Content-Length",
+            )
+        })?;
+        for value in value.split(',') {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid response Content-Length",
+                ));
+            }
+            let parsed = value.parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid response Content-Length",
+                )
+            })?;
+            if length.is_some_and(|previous| previous != parsed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conflicting response Content-Length headers",
+                ));
+            }
+            length = Some(parsed);
+        }
+    }
+    Ok(length.map_or(
+        ResponseBodyFraming::CloseDelimited,
+        ResponseBodyFraming::Length,
+    ))
 }
 
 async fn forward_request_data<W>(
