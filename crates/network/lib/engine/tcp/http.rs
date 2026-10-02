@@ -147,6 +147,21 @@ where
 {
     let request = read_headers(&mut guest).await?;
     let parsed = parse_request(&request)?;
+    if !parsed.connect
+        && !parsed.body.is_empty()
+        && matches!(
+            parsed.body_framing,
+            RequestBodyFraming::None | RequestBodyFraming::Length(0)
+        )
+        && !headers_have_upgrade(&parsed.header_tail)?
+    {
+        guest
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+        return Ok(());
+    }
     let target = parsed.target.clone();
     let protocol = Protocol::Tcp;
     if !hostname_allowed(
