@@ -503,15 +503,13 @@ where
     } else {
         parsed.target.host.clone()
     };
-    let absolute_uri = format!(
-        "http://{authority_host}:{}{}",
-        parsed.target.port, parsed.target.path
-    );
+    let authority = format!("{authority_host}:{}", parsed.target.port);
+    let absolute_uri = format!("http://{authority}{}", parsed.target.path);
     upstream
         .write_all(&rewrite_request_line(&parsed.request_line, &absolute_uri)?)
         .await?;
     upstream
-        .write_all(&upstream_request_headers(&parsed.header_tail)?)
+        .write_all(&upstream_request_headers(&parsed.header_tail, &authority)?)
         .await?;
     upstream.flush().await
 }
@@ -874,8 +872,8 @@ fn rewrite_request_line(line: &[u8], path: &str) -> io::Result<Vec<u8>> {
     Ok(format!("{method} {path} {version}\r\n").into_bytes())
 }
 
-fn upstream_request_headers(headers: &[u8]) -> io::Result<Vec<u8>> {
-    let mut rewritten = Vec::with_capacity(headers.len() + 24);
+fn upstream_request_headers(headers: &[u8], authority: &str) -> io::Result<Vec<u8>> {
+    let mut rewritten = Vec::with_capacity(headers.len() + authority.len() + 32);
     let lines = headers
         .split(|byte| *byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
@@ -904,12 +902,16 @@ fn upstream_request_headers(headers: &[u8]) -> io::Result<Vec<u8>> {
             );
         }
     }
+    rewritten.extend_from_slice(b"Host: ");
+    rewritten.extend_from_slice(authority.as_bytes());
+    rewritten.extend_from_slice(b"\r\n");
     for line in lines {
         let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP proxy header")
         })?;
         let name = &line[..colon];
-        if name.eq_ignore_ascii_case(b"connection")
+        if name.eq_ignore_ascii_case(b"host")
+            || name.eq_ignore_ascii_case(b"connection")
             || name.eq_ignore_ascii_case(b"proxy-connection")
             || name.eq_ignore_ascii_case(b"proxy-authorization")
             || name.eq_ignore_ascii_case(b"expect")
