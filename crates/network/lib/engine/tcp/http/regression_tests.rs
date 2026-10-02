@@ -407,3 +407,72 @@ async fn rejected_upgrade_chunked_response_finishes_without_upstream_eof() {
     proxy.await.unwrap().unwrap();
     upstream.await.unwrap();
 }
+
+#[tokio::test]
+async fn secret_policies_reject_upgrades_before_connecting_upstream() {
+    use crate::secrets::config::{HostPattern, SecretEntry, SecretSubstitution};
+
+    for action in [
+        SecretViolationAction::Block,
+        SecretViolationAction::BlockAndTerminate,
+    ] {
+        for buffered_payload in [false, true] {
+            let secrets = SecretsConfig {
+                secrets: vec![SecretEntry {
+                    env_var: "API_KEY".into(),
+                    value: zeroize::Zeroizing::new("real-value".into()),
+                    source: None,
+                    placeholder: "$TOKEN".into(),
+                    allowed_hosts: vec![HostPattern::Exact("secret.example".into())],
+                    substitution: SecretSubstitution::default(),
+                    passthrough_hosts: Vec::new(),
+                    violation_action: Some(action.clone()),
+                    require_tls_identity: true,
+                }],
+                ..Default::default()
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (mut client, server) = tokio::io::duplex(128 * 1024);
+            let proxy = tokio::spawn(serve(
+                server,
+                address,
+                Arc::new(NetworkPolicy::allow_all()),
+                None,
+                None,
+                Arc::new(secrets),
+                true,
+                Arc::new(SharedState::new(32)),
+            ));
+            let mut request = b"GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec();
+            if buffered_payload {
+                // A masked WebSocket text frame containing the forbidden placeholder.
+                let mask = [1u8, 2, 3, 4];
+                request.extend_from_slice(&[0x81, 0x86]);
+                request.extend_from_slice(&mask);
+                request.extend(
+                    b"$TOKEN"
+                        .iter()
+                        .enumerate()
+                        .map(|(index, byte)| byte ^ mask[index % 4]),
+                );
+            }
+            client.write_all(&request).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 403"));
+            assert!(
+                String::from_utf8_lossy(&response)
+                    .contains("upgraded payloads cannot be checked for secret violations")
+            );
+            proxy.await.unwrap().unwrap();
+            // A completed refusal must not have opened even an empty upstream tunnel.
+            assert!(listener.accept().now_or_never().is_none());
+            let _ = client.write_all(b"$TOKEN").await;
+            assert!(listener.accept().now_or_never().is_none());
+        }
+    }
+}

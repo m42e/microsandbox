@@ -197,6 +197,21 @@ where
         return Ok(());
     }
 
+    if !parsed.connect && !secrets.secrets.is_empty() && headers_have_upgrade(&parsed.header_tail)?
+    {
+        // Upgraded protocols can mask, compress, or otherwise encode their
+        // payloads. The HTTP secret handler cannot enforce their violations,
+        // so refuse the upgrade before opening an upstream connection.
+        let body = "HTTP upgrades are unavailable when secrets are configured because upgraded payloads cannot be checked for secret violations.\n";
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        guest.write_all(response.as_bytes()).await?;
+        guest.shutdown().await?;
+        return Ok(());
+    }
+
     let upstream_result = if parsed.connect {
         HttpConnectProtocol::connect_host(upstream_proxy, &target.host, target.port).await
     } else {

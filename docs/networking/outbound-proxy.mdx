@@ -106,6 +106,8 @@ Enable proxy-side DNS on an HTTP CONNECT proxy when HTTP clients must use the up
 
 HTTP Upgrade requests, including WebSocket handshakes, preserve their upgrade headers. The local proxy starts a bidirectional tunnel through the policy-checked upstream connection only after the upstream accepts the upgrade with `101 Switching Protocols`. A rejected upgrade returns the upstream response and closes the connection.
 
+When any secrets are configured, the local HTTP proxy rejects Upgrade requests with `403 Forbidden` before connecting upstream. Upgraded payloads, such as masked WebSocket frames, cannot be checked reliably by the HTTP secret handler. The response explains this restriction; ordinary HTTP secret substitution continues to work.
+
 The local proxy handles one ordinary HTTP request per TCP connection. It detects additional request data after the request body, including chunked bodies and requests split across network reads. If detected before the response starts, the proxy returns `400 Bad Request`; if the response has already started, it closes the connection. Use a new connection for another request.
 
 This mode is unavailable with the multi-tenant deployment profile, which disables user-configured outbound proxies.
