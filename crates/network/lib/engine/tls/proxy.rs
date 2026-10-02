@@ -207,11 +207,9 @@ impl TlsProxy {
             network_policy
                 .evaluate_proxy_hostname(&sni_name, Protocol::Tcp, guest_dst.port())
                 .is_allow()
-        } else if proxy_dns_address {
-            network_policy
-                .evaluate_egress(guest_dst, Protocol::Tcp, &shared)
-                .is_allow()
         } else {
+            // IP-literal CONNECT targets retain the normal address checks and
+            // SNI deny rules, which do not require a DNS-cache binding.
             matches!(
                 network_policy.evaluate_egress_with_source(
                     guest_dst,
@@ -252,9 +250,7 @@ impl TlsProxy {
         let should_bypass = tls_state.should_bypass(&sni_name);
         if strict
             && should_bypass
-            && if proxy_dns_address {
-                false
-            } else if proxy_dns_hostname {
+            && if proxy_dns_hostname {
                 network_policy.allows_proxy_hostname_via_domain(
                     &sni_name,
                     Protocol::Tcp,

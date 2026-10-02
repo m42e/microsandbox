@@ -1549,6 +1549,9 @@ async fn read_response_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 mod regression_tests;
 
 #[cfg(test)]
+mod tls_regression_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
