@@ -224,8 +224,8 @@ where
 }
 
 async fn serve_plain_http_request<S>(
-    guest: S,
-    upstream: TcpStream,
+    mut guest: S,
+    mut upstream: TcpStream,
     parsed: ParsedRequest,
     secrets: Arc<SecretsConfig>,
     network_policy: Arc<NetworkPolicy>,
@@ -258,6 +258,28 @@ where
         Some(handler) => substitute_secret_bytes(handler, &request_headers, &shared)?,
         None => request_headers,
     };
+
+    let outgoing_request = parse_request(&outgoing_headers)?;
+    let upgrade_request = headers_have_upgrade(&outgoing_request.header_tail)?;
+    if upgrade_request {
+        if !matches!(
+            body_framing,
+            RequestBodyFraming::None | RequestBodyFraming::Length(0)
+        ) {
+            guest
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+        write_upstream_request_headers(&outgoing_headers, &mut upstream).await?;
+        if !body.is_empty() {
+            upstream.write_all(&body).await?;
+        }
+        upstream.flush().await?;
+        // Once the upstream accepts the upgrade, both directions carry the upgraded protocol.
+        tokio::io::copy_bidirectional(&mut guest, &mut upstream).await?;
+        return Ok(());
+    }
 
     let (mut guest_read, mut guest_write) = tokio::io::split(guest);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
@@ -477,6 +499,33 @@ where
         .write_all(&upstream_request_headers(&parsed.header_tail)?)
         .await?;
     upstream.flush().await
+}
+
+fn headers_have_upgrade(headers: &[u8]) -> io::Result<bool> {
+    let mut connection_upgrade = false;
+    let mut upgrade_header = false;
+    for line in headers
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+    {
+        let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP proxy header")
+        })?;
+        let name = &line[..colon];
+        let value = trim_ascii(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"connection")
+            && value
+                .split(|byte| *byte == b',')
+                .map(trim_ascii)
+                .any(|option| option.eq_ignore_ascii_case(b"upgrade"))
+        {
+            connection_upgrade = true;
+        } else if name.eq_ignore_ascii_case(b"upgrade") && !value.is_empty() {
+            upgrade_header = true;
+        }
+    }
+    Ok(connection_upgrade && upgrade_header)
 }
 
 fn substitute_secret_bytes(
@@ -817,6 +866,7 @@ fn upstream_request_headers(headers: &[u8]) -> io::Result<Vec<u8>> {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
+    let upgrade = headers_have_upgrade(headers)?;
     let mut connection_options = Vec::new();
     for line in &lines {
         let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
@@ -850,17 +900,22 @@ fn upstream_request_headers(headers: &[u8]) -> io::Result<Vec<u8>> {
             || name.eq_ignore_ascii_case(b"expect")
             || name.eq_ignore_ascii_case(b"keep-alive")
             || name.eq_ignore_ascii_case(b"te")
-            || name.eq_ignore_ascii_case(b"upgrade")
-            || connection_options
-                .iter()
-                .any(|option| name.eq_ignore_ascii_case(option))
+            || (name.eq_ignore_ascii_case(b"upgrade") && !upgrade)
+            || connection_options.iter().any(|option| {
+                name.eq_ignore_ascii_case(option)
+                    && !(upgrade && option.eq_ignore_ascii_case(b"upgrade"))
+            })
         {
             continue;
         }
         rewritten.extend_from_slice(line);
         rewritten.extend_from_slice(b"\r\n");
     }
-    rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
+    if upgrade {
+        rewritten.extend_from_slice(b"Connection: Upgrade\r\n\r\n");
+    } else {
+        rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
+    }
     Ok(rewritten)
 }
 
