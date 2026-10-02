@@ -790,13 +790,15 @@ fn parse_response_body_framing(
         }
     }
     if let Some(final_coding) = transfer_codings.last() {
-        if transfer_codings[..transfer_codings.len() - 1]
+        if transfer_codings
             .iter()
-            .any(|coding| coding.eq_ignore_ascii_case("chunked"))
+            .filter(|coding| coding.eq_ignore_ascii_case("chunked"))
+            .count()
+            > 1
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "chunked must be the final response transfer coding",
+                "chunked cannot be applied more than once to a response",
             ));
         }
         return Ok(if final_coding.eq_ignore_ascii_case("chunked") {

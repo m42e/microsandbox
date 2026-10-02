@@ -490,6 +490,106 @@ async fn rejected_upgrade_chunked_response_finishes_without_upstream_eof() {
     upstream.await.unwrap();
 }
 
+#[test]
+fn response_framing_uses_final_transfer_coding() {
+    for (headers, expected) in [
+        (b"\r\n".as_slice(), ResponseBodyFraming::CloseDelimited),
+        (b"Content-Length: 7\r\n\r\n", ResponseBodyFraming::Length(7)),
+        (
+            b"Content-Length: 7, 7\r\nContent-Length: 7\r\n\r\n",
+            ResponseBodyFraming::Length(7),
+        ),
+        (
+            b"Transfer-Encoding: chunked\r\n\r\n",
+            ResponseBodyFraming::Chunked,
+        ),
+        (
+            b"Transfer-Encoding: gzip, chunked\r\n\r\n",
+            ResponseBodyFraming::Chunked,
+        ),
+        (
+            b"Transfer-Encoding: gzip\r\n\r\n",
+            ResponseBodyFraming::CloseDelimited,
+        ),
+        (
+            b"Transfer-Encoding: chunked, gzip\r\n\r\n",
+            ResponseBodyFraming::CloseDelimited,
+        ),
+        (
+            b"Transfer-Encoding: Chunked\r\nTransfer-Encoding: GZip\r\n\r\n",
+            ResponseBodyFraming::CloseDelimited,
+        ),
+        (
+            b"Transfer-Encoding: gzip\r\nContent-Length: nonsense\r\n\r\n",
+            ResponseBodyFraming::CloseDelimited,
+        ),
+    ] {
+        assert_eq!(
+            parse_response_body_framing(headers, 403, false).unwrap(),
+            expected
+        );
+    }
+    for status in [100, 204, 304] {
+        assert_eq!(
+            parse_response_body_framing(
+                b"Transfer-Encoding: gzip\r\nContent-Length: 123\r\n\r\n",
+                status,
+                false
+            )
+            .unwrap(),
+            ResponseBodyFraming::None
+        );
+    }
+    assert_eq!(
+        parse_response_body_framing(b"Transfer-Encoding: gzip\r\n\r\n", 403, true).unwrap(),
+        ResponseBodyFraming::None
+    );
+    for headers in [
+        b"Transfer-Encoding: chunked, chunked\r\n\r\n".as_slice(),
+        b"Transfer-Encoding: chunked, gzip, chunked\r\n\r\n",
+        b"Content-Length: 1\r\nContent-Length: 2\r\n\r\n",
+    ] {
+        assert!(parse_response_body_framing(headers, 403, false).is_err());
+    }
+    // Requests still require chunked to be the final transfer coding.
+    assert!(parse_request_body_framing(b"Transfer-Encoding: chunked, gzip\r\n\r\n").is_err());
+}
+
+#[tokio::test]
+async fn rejected_upgrade_forwards_close_delimited_transfer_codings() {
+    // Deterministic gzip encodings of "refused" and "7\r\nrefused\r\n0\r\n\r\n".
+    for (coding, body) in [
+        ("gzip", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff+JM+-NM\x01\x00|\xbe\xd3\xf0\x07\x00\x00\x00".as_slice()),
+        ("chunked, gzip", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff3\xe7\xe5*JM+-NM\xe1\xe52\xe0\xe5\xe2\xe5\x02\x00\x8bT\xcdz\x11\x00\x00\x00"),
+    ] {
+        let (mut client, listener, proxy) = start_proxy().await;
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await.unwrap();
+            assert!(parse_request(&request).unwrap().body.is_empty());
+            let response = format!("HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: {coding}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut followup = Vec::new();
+            stream.read_to_end(&mut followup).await.unwrap();
+            assert!(followup.is_empty());
+        });
+        client.write_all(b"GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nGET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response)).await.unwrap().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        assert!(response.ends_with(body));
+        let headers = &response[..response.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4];
+        let headers = String::from_utf8_lossy(headers);
+        assert!(headers.contains(&format!("Transfer-Encoding: {coding}\r\n")));
+        assert!(!headers.to_ascii_lowercase().contains("content-length:"));
+        assert!(headers.contains("Connection: close\r\n"));
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn secret_policies_reject_upgrades_before_connecting_upstream() {
     use crate::secrets::config::{HostPattern, SecretEntry, SecretSubstitution};
