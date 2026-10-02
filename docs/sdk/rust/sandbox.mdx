@@ -1445,6 +1445,23 @@ Select the guest transparent huge-page policy applied through the kernel command
   </div>
 </div>
 
+#### <span className="msb-recv">sandbox.</span><span className="msb-hn">guest_clock()</span>
+
+```rust
+fn guest_clock(self, policy: GuestClockPolicy) -> Self
+```
+
+Control whether the sandbox clock follows the host. Full snapshots save this setting; restores inherit it unless overridden. Local-only. See [guest clock](/sandboxes/snapshots#keep-the-guest-clock) for details.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>policy</code><span className="msb-type">GuestClockPolicy</span></div>
+    <div className="msb-param-desc"><code>Sync</code> (default) follows host time; <code>Off</code> stops host clock updates after boot.</div>
+  </div>
+</div>
+
 #### <span className="msb-recv">sandbox.</span><span className="msb-hn">network()</span>
 
 ```rust

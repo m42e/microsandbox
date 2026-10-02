@@ -1487,6 +1487,7 @@ pub(crate) mod agent {
             op: FsOp::Mkdir {
                 path: path.to_string(),
                 mode: None,
+                user: None,
             },
             bulk: None,
         };
@@ -1668,6 +1669,7 @@ pub(crate) mod agent {
             op: FsOp::Symlink {
                 target: target.to_string(),
                 link_path: link_path.to_string(),
+                user: None,
             },
             bulk: None,
         };

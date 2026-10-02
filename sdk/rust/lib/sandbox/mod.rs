@@ -116,7 +116,9 @@ pub(crate) fn reserved_label_prefix(key: &str) -> Option<&'static str> {
 // `mod patch` and `mod types` are private; re-export the entry points the
 // local backend's lifecycle and create methods under `backend/local/` call.
 #[cfg(feature = "local")]
-pub(crate) use builder::{apply_checkpoint_restore_constraints, apply_snapshot_root_layout};
+pub(crate) use builder::{
+    apply_checkpoint_restore_constraints, apply_snapshot_guest_clock, apply_snapshot_root_layout,
+};
 #[cfg(feature = "local")]
 pub(crate) use modify::control_checkpoint_create;
 #[cfg(feature = "local")]
@@ -185,11 +187,11 @@ pub use microsandbox_types::{
     TlsConfigPatch,
 };
 pub use microsandbox_types::{
-    EnvVar, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, NetworkSpec, NetworkSpecPatch,
-    PortProtocol, PublishedPortSpec, SandboxLogLevel, SandboxPolicyPatch, SandboxResources,
-    SandboxResourcesPatch, SandboxRuntimeOptions, SandboxRuntimeOptionsPatch, SandboxSpec,
-    SandboxSpecPatch, TransparentHugePagePolicy, VsockRouteSpec, VsockSocketType, VsockSpec,
-    VsockSpecPatch,
+    EnvVar, GuestClockPolicy, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, NetworkSpec,
+    NetworkSpecPatch, PortProtocol, PublishedPortSpec, SandboxLogLevel, SandboxPolicyPatch,
+    SandboxResources, SandboxResourcesPatch, SandboxRuntimeOptions, SandboxRuntimeOptionsPatch,
+    SandboxSpec, SandboxSpecPatch, TransparentHugePagePolicy, VsockRouteSpec, VsockSocketType,
+    VsockSpec, VsockSpecPatch,
 };
 pub use microsandbox_types::{ExternalMountRestorePolicy, ExternalMountWarning};
 #[cfg(feature = "local")]
