@@ -104,9 +104,9 @@ msb run alpine --proxy http://127.0.0.1:3128
 
 Enable proxy-side DNS on an HTTP CONNECT proxy when HTTP clients must use the upstream proxy's resolver. The sandbox starts a local HTTP forward proxy and supplies it through `HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase equivalents. The local proxy checks each requested hostname against the sandbox and platform domain policy, then forwards HTTP requests in absolute form with a `Host` header matching the checked URL authority; HTTPS tunnels use `CONNECT hostname:port`. The guest does not need to send network traffic directly to the upstream proxy.
 
-HTTP Upgrade requests, including WebSocket handshakes, preserve their upgrade headers and continue over a bidirectional tunnel through the policy-checked upstream connection.
+HTTP Upgrade requests, including WebSocket handshakes, preserve their upgrade headers. The local proxy starts a bidirectional tunnel through the policy-checked upstream connection only after the upstream accepts the upgrade with `101 Switching Protocols`. A rejected upgrade returns the upstream response and closes the connection.
 
-The local proxy handles one ordinary HTTP request per TCP connection. If another request is already buffered after a bodyless request, the proxy rejects the connection with `400 Bad Request` rather than silently dropping it.
+The local proxy handles one ordinary HTTP request per TCP connection. It detects additional request data after the request body, including chunked bodies and requests split across network reads. If detected before the response starts, the proxy returns `400 Bad Request`; if the response has already started, it closes the connection. Use a new connection for another request.
 
 This mode is unavailable with the multi-tenant deployment profile, which disables user-configured outbound proxies.
 

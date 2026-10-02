@@ -7,9 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::FutureExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(test)]
-use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -61,6 +60,10 @@ enum RequestBodyFraming {
     Length(usize),
     Chunked,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("the HTTP proxy accepts only one request per connection")]
+struct PipelinedRequest;
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -149,10 +152,11 @@ where
     let parsed = parse_request(&request)?;
     if !parsed.connect
         && !parsed.body.is_empty()
-        && matches!(
-            parsed.body_framing,
-            RequestBodyFraming::None | RequestBodyFraming::Length(0)
-        )
+        && match parsed.body_framing {
+            RequestBodyFraming::None => true,
+            RequestBodyFraming::Length(length) => parsed.body.len() > length,
+            RequestBodyFraming::Chunked => false,
+        }
         && !headers_have_upgrade(&parsed.header_tail)?
     {
         guest
@@ -258,8 +262,23 @@ where
         expect_continue,
         ..
     } = parsed;
+    let head_request = request_line.starts_with(b"HEAD ");
     let mut request_headers = request_line;
     request_headers.extend_from_slice(&header_tail);
+    let upgrade_request = headers_have_upgrade(&header_tail)?;
+    if upgrade_request
+        && !matches!(
+            body_framing,
+            RequestBodyFraming::None | RequestBodyFraming::Length(0)
+        )
+    {
+        guest
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+        return Ok(());
+    }
     let mut secrets_handler = (!secrets.secrets.is_empty()).then(|| {
         SecretsHandler::new_plain_http_proxy_dns(
             &secrets,
@@ -274,19 +293,35 @@ where
         None => request_headers,
     };
 
-    let outgoing_request = parse_request(&outgoing_headers)?;
-    let upgrade_request = headers_have_upgrade(&outgoing_request.header_tail)?;
     if upgrade_request {
-        if !matches!(
-            body_framing,
-            RequestBodyFraming::None | RequestBodyFraming::Length(0)
-        ) {
-            guest
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+        write_upstream_request_headers(&outgoing_headers, &mut upstream).await?;
+        loop {
+            let (response, status) = read_upstream_response_headers(&mut upstream).await?;
+            if status == 101 {
+                if !headers_have_upgrade(
+                    &response[response
+                        .windows(2)
+                        .position(|bytes| bytes == b"\r\n")
+                        .unwrap()
+                        + 2..],
+                )? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "upstream returned 101 without upgrade headers",
+                    ));
+                }
+                guest.write_all(&response).await?;
+                break;
+            }
+            if status < 200 {
+                guest.write_all(&response).await?;
+                continue;
+            }
+            forward_rejected_upgrade(&mut upstream, &mut guest, &response, status, head_request)
                 .await?;
+            guest.shutdown().await?;
             return Ok(());
         }
-        write_upstream_request_headers(&outgoing_headers, &mut upstream).await?;
         if !body.is_empty() {
             upstream.write_all(&body).await?;
         }
@@ -308,39 +343,81 @@ where
             .await?;
     }
 
-    let mut body_offset = 0;
-    let request_task = forward_request_body(
-        &mut guest_read,
-        &body,
-        &mut body_offset,
-        body_framing,
-        &mut secrets_handler,
-        &mut headers_sent,
-        &shared,
-        &mut upstream_write,
-    );
-    let response_task = async {
-        tokio::io::copy(&mut upstream_read, &mut guest_write).await?;
-        guest_write.shutdown().await
-    };
-    tokio::pin!(request_task);
-    tokio::pin!(response_task);
-
-    tokio::select! {
-        response = &mut response_task => response?,
-        request = &mut request_task => {
-            if let Err(error) = request {
+    let mut response_started = false;
+    let request_error = {
+        let response_task = async {
+            let mut buffer = [0; 16 * 1024];
+            loop {
+                let count = upstream_read.read(&mut buffer).await?;
+                if count == 0 {
+                    return guest_write.shutdown().await;
+                }
+                response_started = true;
+                guest_write.write_all(&buffer[..count]).await?;
+            }
+        };
+        tokio::pin!(response_task);
+        let request_result = {
+            let mut body_offset = 0;
+            let request_task = forward_request_body(
+                &mut guest_read,
+                &body,
+                &mut body_offset,
+                body_framing,
+                &mut secrets_handler,
+                &mut headers_sent,
+                &shared,
+                &mut upstream_write,
+            );
+            tokio::pin!(request_task);
+            tokio::select! {
+                biased;
+                request = &mut request_task => request,
+                response = &mut response_task => return response,
+            }
+        };
+        match request_result {
+            Err(error)
                 if !matches!(
                     error.kind(),
                     io::ErrorKind::BrokenPipe
                         | io::ErrorKind::ConnectionReset
                         | io::ErrorKind::NotConnected
-                ) {
-                    return Err(error);
-                }
-                tracing::debug!(%error, "upstream stopped accepting an HTTP request body");
+                ) =>
+            {
+                Some(error)
             }
-            response_task.await?;
+            _ => {
+                let mut extra = [0; 1];
+                tokio::select! {
+                    biased;
+                    result = guest_read.read(&mut extra) => {
+                        if result? != 0 {
+                            Some(io::Error::new(io::ErrorKind::InvalidData, PipelinedRequest))
+                        } else {
+                            response_task.await?;
+                            None
+                        }
+                    }
+                    response = &mut response_task => { response?; None }
+                }
+            }
+        }
+    };
+    if let Some(error) = request_error {
+        if !response_started
+            && error
+                .get_ref()
+                .is_some_and(|source| source.is::<PipelinedRequest>())
+        {
+            guest_write
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await?;
+            guest_write.shutdown().await?;
+        } else {
+            return Err(error);
         }
     }
     Ok(())
@@ -461,8 +538,165 @@ where
             "secret handler did not produce a complete HTTP request",
         ));
     }
+    let mut extra = [0; 1];
+    if *initial_offset < initial.len()
+        || guest
+            .read(&mut extra)
+            .now_or_never()
+            .transpose()?
+            .is_some_and(|count| count > 0)
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, PipelinedRequest));
+    }
     upstream.flush().await?;
     upstream.shutdown().await
+}
+
+async fn read_upstream_response_headers<R>(upstream: &mut R) -> io::Result<(Vec<u8>, u16)>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            if headers.len() >= MAX_HEADERS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream response headers too large",
+                ));
+            }
+            headers.push(upstream.read_u8().await?);
+        }
+        let line_end = headers
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .unwrap();
+        let status_line = std::str::from_utf8(&headers[..line_end]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid upstream status line")
+        })?;
+        let mut fields = status_line.split_ascii_whitespace();
+        let version = fields.next().unwrap_or_default();
+        let status = fields
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|status| (100..600).contains(status));
+        if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || status.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid upstream status line",
+            ));
+        }
+        Ok((headers, status.unwrap()))
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out reading upstream response headers",
+        )
+    })?
+}
+
+async fn forward_rejected_upgrade<R, W>(
+    upstream: &mut R,
+    guest: &mut W,
+    response: &[u8],
+    status: u16,
+    head_request: bool,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let line_end = response
+        .windows(2)
+        .position(|bytes| bytes == b"\r\n")
+        .unwrap()
+        + 2;
+    let headers = &response[line_end..];
+    let (framing, _) = parse_request_body_framing(headers)?;
+    guest.write_all(&response[..line_end]).await?;
+    for line in headers.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let name = line.split(|byte| *byte == b':').next().unwrap_or_default();
+        if !name.eq_ignore_ascii_case(b"connection")
+            && !name.eq_ignore_ascii_case(b"proxy-connection")
+        {
+            guest.write_all(line).await?;
+            guest.write_all(b"\r\n").await?;
+        }
+    }
+    guest.write_all(b"Connection: close\r\n\r\n").await?;
+    if head_request || matches!(status, 204 | 304) {
+        return Ok(());
+    }
+    match framing {
+        RequestBodyFraming::None => {
+            tokio::io::copy(upstream, guest).await?;
+        }
+        RequestBodyFraming::Length(length) => {
+            let count = tokio::io::copy(&mut upstream.take(length as u64), guest).await?;
+            if count != length as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete upstream response body",
+                ));
+            }
+        }
+        RequestBodyFraming::Chunked => {
+            let mut trailer_bytes = 0;
+            loop {
+                let line = read_request_line(upstream, &[], &mut 0).await?;
+                let size_text = line[..line.len() - 2]
+                    .split(|byte| *byte == b';')
+                    .next()
+                    .unwrap_or_default();
+                let size = std::str::from_utf8(size_text)
+                    .ok()
+                    .and_then(|text| u64::from_str_radix(text, 16).ok())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid upstream chunk size")
+                    })?;
+                guest.write_all(&line).await?;
+                if size == 0 {
+                    loop {
+                        let trailer = read_request_line(upstream, &[], &mut 0).await?;
+                        trailer_bytes += trailer.len();
+                        if trailer_bytes > MAX_HEADERS {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "upstream trailers too large",
+                            ));
+                        }
+                        guest.write_all(&trailer).await?;
+                        if trailer == b"\r\n" {
+                            return Ok(());
+                        }
+                    }
+                }
+                let count = tokio::io::copy(&mut (&mut *upstream).take(size), guest).await?;
+                if count != size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "incomplete upstream chunk",
+                    ));
+                }
+                let mut terminator = [0; 2];
+                upstream.read_exact(&mut terminator).await?;
+                if terminator != *b"\r\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid upstream chunk terminator",
+                    ));
+                }
+                guest.write_all(&terminator).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn forward_request_data<W>(
@@ -1183,6 +1417,9 @@ async fn read_response_headers(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
