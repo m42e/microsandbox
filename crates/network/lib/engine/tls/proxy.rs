@@ -248,6 +248,16 @@ impl TlsProxy {
         }
 
         let should_bypass = tls_state.should_bypass(&sni_name);
+        if should_bypass
+            && (proxy_dns_hostname || proxy_dns_address)
+            && !tls_state.secrets.load().secrets.is_empty()
+        {
+            // An IP-literal CONNECT authority cannot tell us which bypass
+            // rule its SNI will select. Refuse that unchecked tunnel here.
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
         if strict
             && should_bypass
             && if proxy_dns_hostname {

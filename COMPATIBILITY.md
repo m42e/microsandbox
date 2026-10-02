@@ -358,6 +358,8 @@ In `http_connect_proxy_dns` mode, only HTTP clients using the injected `HTTP_PRO
 
 Sources: [`crates/network/lib/lib.rs`](crates/network/lib/lib.rs), [`crates/network/lib/engine/network.rs`](crates/network/lib/engine/network.rs), and the remaining modules under [`crates/network/lib`](crates/network/lib).
 
+With secrets configured, proxy-DNS CONNECT tunnels require TLS interception. Disabled interception, ports outside the interception list, and hostname TLS bypasses return an explanatory 403 before upstream connection, even for secret-allowed hosts. An IP-literal CONNECT whose SNI selects a bypass closes before forwarding its TLS payload. This restriction was explicitly approved for the proxy-DNS secret-enforcement fix; launch and persisted configuration formats are unchanged.
+
 Address or MAC changes can create collisions or silently alter policy identity. Protocol changes should be tested with real TCP, UDP, DNS, TLS, HTTP CONNECT, published-port, and secret-substitution clients, including fragmentation, half-close, cancellation, and denied-destination cases.
 
 ## 14. Vsock and SSH Protocol Adapters

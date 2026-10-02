@@ -194,6 +194,22 @@ where
         .as_ref()
         .is_some_and(|state| state.config.intercepted_ports.contains(&target.port));
     if parsed.connect
+        && !secrets.secrets.is_empty()
+        && (!intercepts_tls
+            || tls_state.as_ref().is_some_and(|state| {
+                state.should_bypass(&target.host.trim_end_matches('.').to_ascii_lowercase())
+            }))
+    {
+        let body = "CONNECT tunnels require TLS interception when secrets are configured because unchecked tunnel payloads cannot be checked for secret violations.\n";
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        guest.write_all(response.as_bytes()).await?;
+        guest.shutdown().await?;
+        return Ok(());
+    }
+    if parsed.connect
         && strict
         && !intercepts_tls
         && target.host.parse::<IpAddr>().is_err()

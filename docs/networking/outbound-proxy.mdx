@@ -108,6 +108,8 @@ HTTP Upgrade requests, including WebSocket handshakes, preserve their upgrade he
 
 When any secrets are configured, the local HTTP proxy rejects Upgrade requests with `403 Forbidden` before connecting upstream. Upgraded payloads, such as masked WebSocket frames, cannot be checked reliably by the HTTP secret handler. The response explains this restriction; ordinary HTTP secret substitution continues to work.
 
+With secrets configured, CONNECT requires TLS interception. Tunnels with interception disabled, on ports outside the interception list, or to a hostname configured for TLS bypass receive an explanatory `403 Forbidden` before connecting upstream, including secret-allowed hosts. If an IP-literal CONNECT selects a TLS bypass through its SNI, the tunnel closes before forwarding the TLS payload. Intercepted CONNECT tunnels continue through the existing TLS secret handler.
+
 The local proxy handles one ordinary HTTP request per TCP connection. It detects additional request data after the request body, including chunked bodies and requests split across network reads. If detected before the response starts, the proxy returns `400 Bad Request`; if the response has already started, it closes the connection. Use a new connection for another request.
 
 This mode is unavailable with the multi-tenant deployment profile, which disables user-configured outbound proxies.
