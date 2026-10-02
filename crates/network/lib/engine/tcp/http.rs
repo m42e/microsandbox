@@ -1250,6 +1250,7 @@ fn rewrite_request_line(line: &[u8], path: &str) -> io::Result<Vec<u8>> {
 }
 
 fn upstream_request_headers(headers: &[u8], authority: &str) -> io::Result<Vec<u8>> {
+    let (framing, _) = parse_request_body_framing(headers)?;
     let mut rewritten = Vec::with_capacity(headers.len() + authority.len() + 32);
     let lines = headers
         .split(|byte| *byte == b'\n')
@@ -1258,11 +1259,15 @@ fn upstream_request_headers(headers: &[u8], authority: &str) -> io::Result<Vec<u
         .collect::<Vec<_>>();
     let upgrade = headers_have_upgrade(headers)?;
     let mut connection_options = Vec::new();
+    let mut transfer_encoding = None;
     for line in &lines {
         let colon = line.iter().position(|byte| *byte == b':').ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP proxy header")
         })?;
         let name = &line[..colon];
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            transfer_encoding = Some(trim_ascii(&line[colon + 1..]));
+        }
         if name.eq_ignore_ascii_case(b"connection")
             || name.eq_ignore_ascii_case(b"proxy-connection")
         {
@@ -1288,6 +1293,8 @@ fn upstream_request_headers(headers: &[u8], authority: &str) -> io::Result<Vec<u
         })?;
         let name = &line[..colon];
         if name.eq_ignore_ascii_case(b"host")
+            || name.eq_ignore_ascii_case(b"content-length")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
             || name.eq_ignore_ascii_case(b"connection")
             || name.eq_ignore_ascii_case(b"proxy-connection")
             || name.eq_ignore_ascii_case(b"proxy-authorization")
@@ -1304,6 +1311,21 @@ fn upstream_request_headers(headers: &[u8], authority: &str) -> io::Result<Vec<u
         }
         rewritten.extend_from_slice(line);
         rewritten.extend_from_slice(b"\r\n");
+    }
+    // Regenerate framing after removing hop-by-hop fields. The forwarded body
+    // must have the same boundaries even if Connection nominated these fields.
+    match framing {
+        RequestBodyFraming::None => {}
+        RequestBodyFraming::Length(length) => {
+            rewritten.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+        }
+        RequestBodyFraming::Chunked => {
+            rewritten.extend_from_slice(b"Transfer-Encoding: ");
+            rewritten.extend_from_slice(
+                transfer_encoding.expect("chunked request framing requires Transfer-Encoding"),
+            );
+            rewritten.extend_from_slice(b"\r\n");
+        }
     }
     if upgrade {
         rewritten.extend_from_slice(b"Connection: Upgrade\r\n\r\n");

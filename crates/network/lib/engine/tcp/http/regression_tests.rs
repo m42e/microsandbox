@@ -86,6 +86,88 @@ fn checked_host_replaces_duplicate_client_hosts() {
     }
 }
 
+#[test]
+fn forwarded_headers_regenerate_body_framing() {
+    for connection in ["Connection", "Proxy-Connection"] {
+        let headers = format!(
+            "Host: wrong.example\r\n{connection}: Content-Length, X-Hop\r\nContent-Length: 4, 4\r\nContent-Length: 4\r\nX-Hop: drop\r\n\r\n"
+        );
+        let output = upstream_request_headers(headers.as_bytes(), "example.com:80").unwrap();
+        let text = String::from_utf8(output.clone()).unwrap();
+        assert!(matches!(
+            parse_request_body_framing(&output).unwrap().0,
+            RequestBodyFraming::Length(4)
+        ));
+        assert_eq!(text.matches("Content-Length:").count(), 1);
+        assert!(!text.contains("X-Hop:"));
+        assert!(text.contains("Host: example.com:80\r\n"));
+        for encoding in ["chunked", "gzip, chunked"] {
+            let headers =
+                format!("{connection}: Transfer-Encoding\r\nTransfer-Encoding: {encoding}\r\n\r\n");
+            let output = upstream_request_headers(headers.as_bytes(), "example.com:80").unwrap();
+            assert!(matches!(
+                parse_request_body_framing(&output).unwrap().0,
+                RequestBodyFraming::Chunked
+            ));
+            assert!(
+                String::from_utf8(output)
+                    .unwrap()
+                    .contains(&format!("Transfer-Encoding: {encoding}\r\n"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn connection_options_preserve_forwarded_body_boundaries() {
+    let payload = b"GET http://blocked.example/ HTTP/1.1\r\nHost: blocked.example\r\n\r\n";
+    for connection in ["Connection", "Proxy-Connection"] {
+        for chunked in [false, true] {
+            let (mut client, listener, proxy) = start_proxy().await;
+            let upstream = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut forwarded = Vec::new();
+                stream.read_to_end(&mut forwarded).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                forwarded
+            });
+            let (field, value, body) = if chunked {
+                let mut body = format!("{:x}\r\n", payload.len()).into_bytes();
+                body.extend_from_slice(payload);
+                body.extend_from_slice(b"\r\n0\r\n\r\n");
+                ("Transfer-Encoding", "chunked".to_string(), body)
+            } else {
+                (
+                    "Content-Length",
+                    payload.len().to_string(),
+                    payload.to_vec(),
+                )
+            };
+            let mut request = format!("POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\n{connection}: {field}\r\n{field}: {value}\r\n\r\n").into_bytes();
+            request.extend_from_slice(&body);
+            client.write_all(&request).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+            proxy.await.unwrap().unwrap();
+            let forwarded = parse_request(&upstream.await.unwrap()).unwrap();
+            assert_eq!(forwarded.target.host, "example.com");
+            assert_eq!(forwarded.body, body);
+            assert!(if chunked {
+                matches!(forwarded.body_framing, RequestBodyFraming::Chunked)
+            } else {
+                matches!(forwarded.body_framing, RequestBodyFraming::Length(length) if length == payload.len())
+            });
+        }
+    }
+}
+
 #[tokio::test]
 async fn coalesced_bodyless_pipeline_is_rejected() {
     let (mut client, _listener, proxy) = start_proxy().await;
